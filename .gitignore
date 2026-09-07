@@ -1,0 +1,15 @@
+node_modules/
+dist/
+.env
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+prisma/dev.db
+prisma/*.db
+logs/
+*.log
+npm-debug.log*
+.DS_Store
+coverage/
+.nyc_output/

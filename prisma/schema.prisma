@@ -1,0 +1,232 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Product {
+  id           String    @id @default(cuid())
+  title        String
+  slug         String    @unique
+  gender       String
+  category     String
+  subcategory  String
+  price        Float
+  salePrice    Float?
+  onSale       Boolean   @default(false)
+  isNew        Boolean   @default(false)
+  isBestSeller Boolean   @default(false)
+  isFeatured   Boolean   @default(false)
+  rating       Float     @default(5.0)
+  reviewCount  Int       @default(0)
+  description  String    @default("")
+  fabricCare   String    @default("Premium material blend. Hand wash or dry clean recommended.")
+  images       String    @default("[]")
+  sizes        String    @default("[]")
+  colors       String    @default("[]")
+  isActive     Boolean   @default(true)
+  createdAt    DateTime  @default(now())
+  variants     Variant[]
+
+  @@index([gender, category, isActive])
+  @@index([isFeatured, isNew])
+}
+
+model Variant {
+  id            String  @id @default(cuid())
+  productId     String
+  sku           String  @unique
+  barcode       String?
+  size          String
+  color         String
+  price         Float
+  salePrice     Float?
+  stockQuantity Int     @default(10)
+  product       Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+}
+
+model Order {
+  id                     String               @id @default(cuid())
+  orderNumber            String               @unique
+  customerName           String
+  customerEmail          String               @default("")
+  customerPhone          String
+  customerCounty         String
+  customerTownCity       String
+  customerAddress        String
+  customerNotes          String               @default("")
+  items                  String
+  subtotal               Float
+  discount               Float                @default(0)
+  couponCode             String?
+  deliveryFee            Float                @default(350)
+  total                  Float
+  currency               String               @default("KES")
+  paymentMethod          String
+  paymentStatus          String               @default("PENDING")
+  fulfillmentStatus      String               @default("PENDING")
+  mpesaPhone             String?
+  mpesaReceipt           String?              @unique
+  createdAt              DateTime             @default(now())
+  trackingTokenHash      String               @unique
+  mpesaCheckoutRequestId String?              @unique
+  mpesaInitiatedAt       DateTime?
+  mpesaMerchantRequestId String?              @unique
+  paymentNotifications   PaymentNotification?
+}
+
+model PaymentNotification {
+  id               String    @id @default(cuid())
+  orderId          String?   @unique
+  customerName     String
+  customerPhone    String
+  amount           Float
+  currency         String    @default("KES")
+  paymentMethod    String    @default("MPESA")
+  mpesaReceipt     String?
+  createdAt        DateTime  @default(now())
+  acknowledgedAt   DateTime?
+  paymentReference String    @unique
+  posSaleId        String?   @unique
+  order            Order?    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  posSale          PosSale?  @relation(fields: [posSaleId], references: [id], onDelete: Cascade)
+
+  @@index([acknowledgedAt, createdAt])
+}
+
+model Coupon {
+  code           String  @id
+  discountType   String
+  discountValue  Float
+  minOrderAmount Float   @default(0)
+  expiryDate     String
+  usageLimit     Int     @default(100)
+  usageCount     Int     @default(0)
+  isActive       Boolean @default(true)
+}
+
+model Admin {
+  id               String            @id @default(cuid())
+  email            String            @unique
+  passwordHash     String
+  name             String
+  role             String            @default("OWNER")
+  pinCode          String            @default("1234")
+  createdAt        DateTime          @default(now())
+  posLoginRequests PosLoginRequest[]
+}
+
+model StoreSettings {
+  id                    String   @id @default("default")
+  storeName             String   @default("Gem & Crystal Fashion Hub")
+  tagline               String   @default("BE BOLD. BE BRIGHT. BE YOU.")
+  location              String   @default("Roysambu, Nairobi, Kenya")
+  phone                 String   @default("+254 718 796 296")
+  whatsappNumber        String   @default("254718796296")
+  deliveryFeeDisclaimer String   @default("Delivery fee is paid separately by the customer and is not included in the product order total unless otherwise stated by the shop.")
+  aiChatEnabled         Boolean  @default(true)
+  updatedAt             DateTime @updatedAt
+}
+
+model PosLoginRequest {
+  id            String   @id @default(cuid())
+  cashierId     String
+  cashierName   String
+  deviceId      String
+  location      String
+  biometricId   String?
+  pollTokenHash String   @unique
+  status        String   @default("PENDING")
+  createdAt     DateTime @default(now())
+  expiresAt     DateTime
+  cashier       Admin    @relation(fields: [cashierId], references: [id], onDelete: Cascade)
+
+  @@index([status, expiresAt])
+  @@index([cashierId, createdAt])
+}
+
+model PosSession {
+  id               String    @id @default(cuid())
+  requestId        String    @unique
+  cashierId        String
+  cashierName      String
+  approvedBy       String
+  sessionTokenHash String    @unique
+  status           String    @default("ACTIVE")
+  startTime        DateTime  @default(now())
+  expiresAt        DateTime
+  endTime          DateTime?
+}
+
+model PosSale {
+  id                     String               @id @default(cuid())
+  receiptNumber          String               @unique
+  cashierName            String
+  customerName           String               @default("Walk-in Customer")
+  customerPhone          String?
+  mpesaReceipt           String?              @unique
+  items                  String
+  subtotal               Float
+  discount               Float                @default(0)
+  total                  Float
+  paymentMethod          String
+  cashReceived           Float?
+  changeGiven            Float?
+  createdAt              DateTime             @default(now())
+  mpesaCheckoutRequestId String?              @unique
+  mpesaInitiatedAt       DateTime?
+  mpesaMerchantRequestId String?              @unique
+  paymentStatus          String               @default("PAID")
+  paymentNotifications   PaymentNotification?
+}
+
+model HardwareConfig {
+  id                String  @id @default("pos-01")
+  tabletName        String  @default("Gem & Crystal POS Tablet 01")
+  tabletConnected   Boolean @default(false)
+  barcodeScanner    Boolean @default(false)
+  fingerprintReader Boolean @default(false)
+  receiptPrinter    Boolean @default(false)
+  cashDrawer        Boolean @default(false)
+  status            String  @default("IDLE")
+}
+
+model AuditLog {
+  id        String   @id @default(cuid())
+  actor     String
+  action    String
+  details   String
+  ipAddress String?
+  createdAt DateTime @default(now())
+
+  @@index([action, createdAt])
+}
+
+model InventoryMovement {
+  id            String   @id @default(cuid())
+  variantId     String
+  type          String
+  quantity      Int
+  previousStock Int
+  newStock      Int
+  reason        String
+  referenceType String?
+  referenceId   String?
+  actor         String   @default("System")
+  createdAt     DateTime @default(now())
+
+  @@index([variantId, createdAt])
+}
+
+model Customer {
+  id        String   @id @default(cuid())
+  name      String
+  phone     String   @unique
+  email     String?
+  county    String?
+  city      String?
+  createdAt DateTime @default(now())
+}
