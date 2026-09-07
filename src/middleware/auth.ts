@@ -10,6 +10,11 @@ if (!JWT_SECRET) {
   throw new Error('JWT_SECRET is required. Set it in the API environment.');
 }
 
+// Issuer/audience constants — tokens signed by this API are only valid
+// when verified with matching iss and aud claims.
+const JWT_ISSUER = 'gem-crystal-api';
+const JWT_AUDIENCE = 'gem-crystal-admin';
+
 export type AdminRole = 'OWNER' | 'CASHIER';
 
 export interface AuthRequest extends Request {
@@ -35,7 +40,10 @@ export async function requireAdmin(req: AuthRequest, res: Response, next: NextFu
   const token = authHeader.slice('Bearer '.length).trim();
 
   try {
-    const decoded = jwt.verify(token, JWT_SECRET) as unknown as JwtPayload;
+    const decoded = jwt.verify(token, JWT_SECRET, {
+      issuer: JWT_ISSUER,
+      audience: JWT_AUDIENCE,
+    }) as unknown as JwtPayload;
 
     if (!decoded.adminId || !decoded.email || !decoded.role) {
       res.status(401).json({ success: false, error: { code: 'UNAUTHORIZED', message: 'Invalid authentication token' } });
@@ -75,5 +83,9 @@ export function requireRole(...allowedRoles: AdminRole[]) {
 }
 
 export function generateToken(adminId: string, email: string, role: AdminRole): string {
-  return jwt.sign({ adminId, email, role }, JWT_SECRET, { expiresIn: '12h' });
+  return jwt.sign({ adminId, email, role }, JWT_SECRET, {
+    expiresIn: '12h',
+    issuer: JWT_ISSUER,
+    audience: JWT_AUDIENCE,
+  });
 }

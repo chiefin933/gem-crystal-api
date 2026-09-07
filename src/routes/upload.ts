@@ -13,10 +13,10 @@ const upload = multer({
     fileSize: MAX_IMAGE_BYTES,
   },
   fileFilter: (_req, file, cb) => {
-    if (['image/jpeg', 'image/png', 'image/webp', 'image/gif'].includes(file.mimetype)) {
+    if (['image/jpeg', 'image/png', 'image/webp'].includes(file.mimetype)) {
       cb(null, true);
     } else {
-      cb(new Error('Only JPEG, PNG, WEBP, and GIF images are allowed'));
+      cb(new Error('Only JPEG, PNG, and WEBP images are allowed'));
     }
   },
 });
@@ -27,9 +27,6 @@ function hasValidImageSignature(buffer: Buffer, mimetype: string): boolean {
   }
   if (mimetype === 'image/png') {
     return buffer.length >= 8 && buffer.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
-  }
-  if (mimetype === 'image/gif') {
-    return buffer.length >= 6 && ['GIF87a', 'GIF89a'].includes(buffer.subarray(0, 6).toString('ascii'));
   }
   if (mimetype === 'image/webp') {
     return buffer.length >= 12
@@ -66,7 +63,7 @@ function uploadBufferToCloudinary(fileBuffer: Buffer, mimetype: string): Promise
         {
           folder: 'gem-and-crystal/products',
           resource_type: 'image',
-          allowed_formats: ['jpg', 'jpeg', 'png', 'webp', 'gif'],
+          allowed_formats: ['jpg', 'jpeg', 'png', 'webp'],
           transformation: [
             { quality: 'auto', fetch_format: 'auto' },
           ],

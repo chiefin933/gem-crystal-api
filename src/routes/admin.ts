@@ -1,48 +1,91 @@
 import { Router, Request, Response } from 'express';
 import bcrypt from 'bcryptjs';
+import { z } from 'zod';
 import { prisma } from '../lib/prisma';
 import { generateToken, requireAdmin, requireRole, AuthRequest } from '../middleware/auth';
 
 const router = Router();
 
+// ── Validation schema ─────────────────────────────────────────────────────
+const AdminLoginSchema = z.object({
+  email: z
+    .string({ required_error: 'Email is required' })
+    .trim()
+    .toLowerCase()
+    .email('Invalid email format')
+    .max(254, 'Email exceeds maximum length'),
+  password: z
+    .string({ required_error: 'Password is required' })
+    .min(6, 'Password too short')
+    .max(128, 'Password exceeds maximum length'),
+});
+
 // ── POST /api/admin/login ─────────────────────────────────────────────────
 router.post('/login', async (req: Request, res: Response) => {
+  const parsed = AdminLoginSchema.safeParse(req.body);
+  if (!parsed.success) {
+    // Return a generic message — don't reveal which field failed
+    // to avoid leaking account-enumeration information.
+    res.status(400).json({
+      success: false,
+      error: { code: 'VALIDATION_ERROR', message: 'Invalid request payload' },
+    });
+    return;
+  }
+
   try {
-    const { email, password } = req.body as { email: string; password: string };
+    const { email, password } = parsed.data;
 
-    if (!email || !password) {
-      res.status(400).json({ error: 'Email and password are required' });
-      return;
-    }
+    const admin = await prisma.admin.findUnique({ where: { email } });
 
-    const admin = await prisma.admin.findUnique({ where: { email: email.toLowerCase().trim() } });
+    // Constant-time-ish: always run bcrypt even if account not found
+    // to prevent timing-based account enumeration.
+    const passwordHash = admin?.passwordHash ?? '$2a$12$invalidhashtopreventtimingleak000000000000000000000000';
+    const isValid = await bcrypt.compare(password, passwordHash);
 
-    if (!admin) {
-      res.status(401).json({ error: 'Invalid credentials' });
-      return;
-    }
-
-    const isValid = await bcrypt.compare(password, admin.passwordHash);
-    if (!isValid) {
-      res.status(401).json({ error: 'Invalid credentials' });
+    if (!admin || !isValid) {
+      res.status(401).json({
+        success: false,
+        error: { code: 'INVALID_CREDENTIALS', message: 'Invalid credentials' },
+      });
       return;
     }
 
     if (admin.role !== 'OWNER') {
-      res.status(403).json({ error: 'Owner access is required for the admin panel' });
+      res.status(403).json({
+        success: false,
+        error: { code: 'FORBIDDEN', message: 'Owner access is required for the admin panel' },
+      });
       return;
     }
 
     const token = generateToken(admin.id, admin.email, admin.role as 'OWNER' | 'CASHIER');
 
     res.json({
-      token,
-      admin: { id: admin.id, email: admin.email, name: admin.name, role: admin.role },
+      success: true,
+      data: {
+        token,
+        admin: { id: admin.id, email: admin.email, name: admin.name, role: admin.role },
+      },
     });
   } catch (error) {
     console.error('Admin login error:', error);
-    res.status(500).json({ error: 'Login failed' });
+    res.status(500).json({
+      success: false,
+      error: { code: 'INTERNAL_SERVER_ERROR', message: 'Login failed' },
+    });
   }
+});
+
+// ── POST /api/admin/logout ────────────────────────────────────────────────
+// Stateless JWT logout — instructs the client to discard its token.
+// For full server-side revocation, a token blocklist/version field
+// would be added to the Admin model (Phase 5 hardening).
+router.post('/logout', requireAdmin, (_req: AuthRequest, res: Response) => {
+  res.json({
+    success: true,
+    data: { message: 'Logged out successfully. Please discard your token.' },
+  });
 });
 
 // ── GET /api/admin/me ─────────────────────────────────────────────────────

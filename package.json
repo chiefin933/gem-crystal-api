@@ -7,8 +7,10 @@
     "build": "tsc",
     "start": "node dist/index.js",
     "db:push": "prisma db push",
-    "db:seed": "tsx prisma/seed.ts",
-    "setup": "prisma db push && tsx prisma/seed.ts"
+    "db:seed:dev": "NODE_ENV=development tsx prisma/seed.ts",
+    "db:migrate:deploy": "prisma migrate deploy",
+    "db:migrate:dev": "prisma migrate dev",
+    "setup:dev": "prisma db push && NODE_ENV=development tsx prisma/seed.ts"
   },
   "dependencies": {
     "@prisma/client": "^5.16.0",

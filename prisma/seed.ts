@@ -4,7 +4,22 @@ import bcrypt from 'bcryptjs';
 const prisma = new PrismaClient();
 
 async function main() {
-  console.log('🌱 Clearing all demo products and data from Gem & Crystal database...');
+  // ── Production safety guard ─────────────────────────────────────────────
+  // This script WIPES business data. It must never run against a production
+  // database. If you need to initialise production credentials, use the
+  // dedicated `npm run db:init:prod` script which only upserts the admin
+  // account and store settings without touching any business records.
+  if (process.env.NODE_ENV === 'production') {
+    console.error('');
+    console.error('❌ REFUSED: seed.ts will not run in NODE_ENV=production.');
+    console.error('   This script deletes ALL products, orders, and POS sales.');
+    console.error('   To initialise a fresh production database use:');
+    console.error('     npm run db:migrate:deploy');
+    console.error('');
+    process.exit(1);
+  }
+
+  console.log('🌱 [DEV] Clearing all demo data from Gem & Crystal database...');
 
   // 1. Clear all demo data tables
   await prisma.variant.deleteMany({});
