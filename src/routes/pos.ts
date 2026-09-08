@@ -1,6 +1,8 @@
 import { Router, Request, Response, NextFunction } from 'express';
 import crypto from 'crypto';
 import bcrypt from 'bcryptjs';
+import rateLimit from 'express-rate-limit';
+import { z } from 'zod';
 import { prisma } from '../lib/prisma';
 import { ApiError } from '../lib/ApiError';
 import { AuthRequest, requireAdmin, requireRole } from '../middleware/auth';
@@ -11,8 +13,66 @@ const router = Router();
 // with an older generated client during the migration step.
 const db = prisma as any;
 
+// ── Shared stock restoration helper ───────────────────────────────────────
+// Restores stock for all line items in a failed POS sale and records
+// inventory movements. Called when M-PESA initiation definitively fails.
+async function releaseFailedPosSaleReservation(tx: any, sale: any, reason: string): Promise<void> {
+  const items = JSON.parse(sale.items) as Array<{ variantId: string; quantity: number }>;
+  for (const item of items) {
+    if (!item.variantId || !Number.isInteger(item.quantity) || item.quantity < 1) continue;
+    const variant = await tx.variant.findUnique({ where: { id: item.variantId } });
+    if (!variant) continue;
+    const restored = await tx.variant.update({
+      where: { id: item.variantId },
+      data: { stockQuantity: { increment: item.quantity } },
+      select: { stockQuantity: true },
+    });
+    await tx.inventoryMovement.create({
+      data: {
+        variantId: item.variantId,
+        type: 'RETURN',
+        quantity: item.quantity,
+        previousStock: restored.stockQuantity - item.quantity,
+        newStock: restored.stockQuantity,
+        reason,
+        referenceType: 'POS_SALE',
+        referenceId: sale.receiptNumber,
+        actor: 'POS payment service',
+      },
+    });
+  }
+}
+
 const REQUEST_TTL_MS = 2 * 60 * 1000;
 const POS_SESSION_TTL_MS = 12 * 60 * 60 * 1000;
+
+// ── PIN brute-force protection ─────────────────────────────────────────────
+// A 4-digit PIN has only 10,000 combinations. Without rate limiting an
+// attacker with network access to /auth-request could guess it quickly.
+// 5 failed attempts / 5 min per IP triggers a 429; successful requests
+// are NOT counted so a legitimate cashier is never locked out by a good login.
+const pinLimiter = rateLimit({
+  windowMs: 5 * 60 * 1000,
+  max: 5,
+  skipSuccessfulRequests: true,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {
+    success: false,
+    error: {
+      code: 'UNAUTHORIZED',
+      message: 'Too many login attempts. Please wait 5 minutes before trying again.',
+    },
+  },
+});
+
+// ── POS auth request schema ────────────────────────────────────────────────
+const PosAuthRequestSchema = z.object({
+  cashierName: z.string().trim().min(2, 'Cashier name is required').max(120),
+  pinCode:     z.string().trim().min(4, 'PIN must be at least 4 digits').max(12),
+  deviceId:    z.string().trim().max(100).optional(),
+  biometricId: z.string().trim().max(200).optional(),
+}).strict();
 
 function hashSessionToken(token: string): string {
   return crypto.createHash('sha256').update(token).digest('hex');
@@ -68,40 +128,56 @@ async function requirePosSession(req: Request, res: Response, next: NextFunction
 }
 
 // ── GET /api/pos/payment-notifications ────────────────────────────────────
-// A confirmed payment is acknowledged only when an authenticated POS session
-// retrieves it. This gives the cashier one clear alert without exposing sales
-// data to an unauthenticated browser or replaying it after acknowledgement.
+// Returns unacknowledged payment notifications to the POS terminal.
+// Notifications are NOT marked acknowledged here — the POS must confirm
+// successful receipt by calling POST /payment-notifications/:id/acknowledge.
+// This prevents notifications from being silently lost if Wi-Fi drops
+// between the backend responding and the POS displaying the alert.
 router.get('/payment-notifications', requirePosSession, async (_req: Request, res: Response, next: NextFunction) => {
   try {
-    const notifications = await db.$transaction(async (tx: any) => {
-      const pending = await tx.paymentNotification.findMany({
-        where: { acknowledgedAt: null },
-        orderBy: { createdAt: 'asc' },
-        take: 20,
-      });
-
-      if (pending.length) {
-        await tx.paymentNotification.updateMany({
-          where: { id: { in: pending.map((notification: any) => notification.id) }, acknowledgedAt: null },
-          data: { acknowledgedAt: new Date() },
-        });
-      }
-      return pending;
+    const notifications = await db.paymentNotification.findMany({
+      where: { acknowledgedAt: null },
+      orderBy: { createdAt: 'asc' },
+      take: 20,
     });
 
     res.json({
       success: true,
-      notifications: notifications.map((notification: any) => ({
-        id: notification.id,
-        orderNumber: notification.paymentReference,
-        customerName: notification.customerName,
-        customerPhone: notification.customerPhone,
-        amount: notification.amount,
-        currency: notification.currency,
-        paymentMethod: notification.paymentMethod,
-        mpesaReceipt: notification.mpesaReceipt,
-        confirmedAt: notification.createdAt,
+      notifications: notifications.map((n: any) => ({
+        id: n.id,
+        orderNumber: n.paymentReference,
+        customerName: n.customerName,
+        customerPhone: n.customerPhone,
+        amount: n.amount,
+        currency: n.currency,
+        paymentMethod: n.paymentMethod,
+        mpesaReceipt: n.mpesaReceipt,
+        confirmedAt: n.createdAt,
       })),
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// ── POST /api/pos/payment-notifications/:id/acknowledge ────────────────────
+// Called by the POS AFTER it has successfully displayed/processed a payment
+// notification. Only then is it marked acknowledged so it won't be re-delivered.
+// Using a separate acknowledgement step means a crashed or disconnected POS
+// will receive the notification again on the next poll.
+router.post('/payment-notifications/:id/acknowledge', requirePosSession, async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const result = await db.paymentNotification.updateMany({
+      where: {
+        id: req.params.id,
+        acknowledgedAt: null, // idempotent — already-acked notifications are a no-op
+      },
+      data: { acknowledgedAt: new Date() },
+    });
+
+    res.json({
+      success: true,
+      acknowledged: result.count === 1,
     });
   } catch (error) {
     next(error);
@@ -133,22 +209,18 @@ router.get('/hardware', async (_req: Request, res: Response, next: NextFunction)
 });
 
 // ── POST /api/pos/auth-request ─────────────────────────────────────────────
-router.post('/auth-request', async (req: Request, res: Response, next: NextFunction) => {
+router.post('/auth-request', pinLimiter, async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const { cashierName, pinCode, biometricId, deviceId } = req.body as {
-      cashierName?: string;
-      pinCode?: string;
-      biometricId?: string;
-      deviceId?: string;
-    };
-
-    if (!cashierName || !pinCode) {
-      throw ApiError.badRequest('Cashier Name and PIN Code are required', 'INVALID_CREDENTIALS');
+    const parsed = PosAuthRequestSchema.safeParse(req.body);
+    if (!parsed.success) {
+      // Return a generic message — don't distinguish "missing field" from
+      // "wrong format" to avoid leaking which cashier names exist.
+      throw ApiError.badRequest('Invalid login credentials', 'INVALID_CREDENTIALS');
     }
 
-    const normalizedName = cashierName.trim();
+    const { cashierName, pinCode, biometricId, deviceId } = parsed.data;
     const cashier = await db.admin.findFirst({
-      where: { name: normalizedName, role: 'CASHIER' },
+      where: { name: cashierName, role: 'CASHIER' },
       select: { id: true, name: true, pinCode: true },
     });
 
@@ -272,6 +344,35 @@ router.get('/auth-status/:requestId', async (req: Request, res: Response, next: 
         expiresAt: session.expiresAt,
       } : null,
     });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// ── POST /api/pos/logout ───────────────────────────────────────────────────
+// Immediately ends the active POS session for the authenticated cashier.
+// Using expiry alone means a stolen session token remains valid for up to
+// 12 hours; an explicit logout closes the window immediately.
+router.post('/logout', requirePosSession, async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const session = (req as any).posSession as { id: string; cashierName: string };
+
+    await db.$transaction(async (tx: any) => {
+      await tx.posSession.updateMany({
+        where: { id: session.id, status: 'ACTIVE' },
+        data: { status: 'ENDED', endTime: new Date() },
+      });
+      await tx.auditLog.create({
+        data: {
+          actor: session.cashierName,
+          action: 'POS_LOGOUT',
+          details: `POS session ended by cashier ${session.cashierName}`,
+          ipAddress: req.ip,
+        },
+      });
+    });
+
+    res.json({ success: true, message: 'POS session ended successfully.' });
   } catch (error) {
     next(error);
   }
@@ -473,7 +574,18 @@ router.post('/checkout', requirePosSession, async (req: Request, res: Response, 
     }
     const serverDiscount = Number((serverSubtotal * safeDiscountPercent / 100).toFixed(2));
     const serverTotal = Number((serverSubtotal - serverDiscount).toFixed(2));
-    const finalPaymentMethod = ['CASH', 'MPESA', 'CARD'].includes(paymentMethod) ? paymentMethod : 'CASH';
+    const finalPaymentMethod = paymentMethod as string;
+    if (!['CASH', 'MPESA'].includes(finalPaymentMethod)) {
+      // CARD is not yet integrated with a real card processor/terminal.
+      // Accepting it would record a PAID sale without authorization evidence.
+      // Reject all unknown payment methods rather than silently defaulting.
+      throw ApiError.badRequest(
+        finalPaymentMethod === 'CARD'
+          ? 'Card payment is not yet available on this terminal. Please use Cash or M-PESA.'
+          : 'Invalid payment method. Accepted: CASH, MPESA',
+        'BAD_REQUEST',
+      );
+    }
     if (finalPaymentMethod === 'CASH' && Number(cashReceived) < serverTotal) {
       throw ApiError.badRequest('Cash received is less than the sale total');
     }
@@ -552,10 +664,13 @@ router.post('/checkout', requirePosSession, async (req: Request, res: Response, 
       });
 
       if (customerPhone) {
+        // Use the normalized phone so +254712345678, 0712345678, and
+        // 254712345678 all resolve to the same customer record.
+        const persistPhone = normalizedPhone || customerPhone;
         await tx.customer.upsert({
-          where: { phone: customerPhone },
+          where: { phone: persistPhone },
           update: { name: finalCustomerName },
-          create: { name: finalCustomerName, phone: customerPhone },
+          create: { name: finalCustomerName, phone: persistPhone },
         });
       }
 
@@ -587,7 +702,34 @@ router.post('/checkout', requirePosSession, async (req: Request, res: Response, 
           },
         })).count === 1;
       } catch (error) {
-        console.error(`M-PESA request could not be started for ${sale.receiptNumber}`, error instanceof Error ? error.message : 'unknown error');
+        // STK Push definitively failed — Safaricom returned an error or the
+        // request timed out before reaching Daraja. We mark the sale FAILED
+        // and restore stock so inventory can never be permanently stranded.
+        // If the failure is a network timeout (ambiguous), the reconciliation
+        // mechanism will catch any callback that Safaricom still delivers.
+        console.error(`M-PESA STK initiation failed for ${sale.receiptNumber}:`, error instanceof Error ? error.message : error);
+
+        await db.$transaction(async (tx: any) => {
+          await tx.posSale.updateMany({
+            where: { id: sale.id, paymentStatus: 'PENDING' },
+            data: { paymentStatus: 'FAILED' },
+          });
+          await releaseFailedPosSaleReservation(tx, sale, `M-PESA STK initiation failed for receipt #${sale.receiptNumber}`);
+          await tx.auditLog.create({
+            data: {
+              actor: session.cashierName,
+              action: 'PAYMENT_FAILED',
+              details: `M-PESA STK initiation failed for receipt #${sale.receiptNumber}. Stock restored. Error: ${error instanceof Error ? error.message : 'unknown'}`,
+            },
+          });
+        });
+
+        // Return a clear error so the POS shows the cashier an actionable message
+        // rather than showing a pending state that will never resolve.
+        throw ApiError.badRequest(
+          'M-PESA payment could not be initiated. Stock has been released. Please retry or accept cash.',
+          'PAYMENT_FAILED',
+        );
       }
     }
 

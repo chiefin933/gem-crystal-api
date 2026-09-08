@@ -348,9 +348,36 @@ router.post('/', async (req: Request, res: Response, next: NextFunction) => {
         });
         paymentInitiated = saved.count === 1;
       } catch (error) {
-        // An order is still safely recorded as pending if the provider is
-        // unavailable; it must never be represented as paid in this case.
-        console.error(`M-PESA request could not be started for ${order.orderNumber}`, error instanceof Error ? error.message : 'unknown error');
+        // STK Push definitively failed. Mark the order FAILED and restore
+        // stock + coupon so inventory and usage counts can never be
+        // permanently stranded by a provider error.
+        // If the failure was a network timeout (ambiguous), Safaricom's
+        // callback — if it ever arrives — will be rejected because the
+        // order is no longer PENDING, preventing double-payment.
+        console.error(`M-PESA STK initiation failed for ${order.orderNumber}:`, error instanceof Error ? error.message : error);
+
+        await prisma.$transaction(async (tx) => {
+          await tx.order.updateMany({
+            where: { id: order.id, paymentStatus: 'PENDING' },
+            data: { paymentStatus: 'FAILED' },
+          });
+          await releaseFailedOrderReservation(tx, order, `M-PESA STK initiation failed for order #${order.orderNumber}`);
+          await tx.auditLog.create({
+            data: {
+              actor: 'Storefront checkout',
+              action: 'PAYMENT_FAILED',
+              details: `M-PESA STK initiation failed for order #${order.orderNumber}. Stock restored. Error: ${error instanceof Error ? error.message : 'unknown'}`,
+              ipAddress: req.ip,
+            },
+          });
+        });
+
+        // Surface a clear error to the storefront so the customer knows
+        // to retry rather than seeing a phantom pending order.
+        throw ApiError.badRequest(
+          'M-PESA payment could not be initiated. Please try again or contact the shop.',
+          'PAYMENT_FAILED',
+        );
       }
     }
 
