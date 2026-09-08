@@ -629,27 +629,34 @@ router.post('/checkout', requirePosSession, async (req: Request, res: Response, 
         const variant = variantsById.get(item.variantId);
         if (!variant) throw ApiError.notFound(`Product variant ${item.variantId} was not found`);
 
-        // Atomic stock deduction: the database itself enforces stock >= requested quantity.
-        const updated = await tx.$executeRaw`
+        // Atomic stock deduction with RETURNING so the InventoryMovement
+        // records the exact transition verified by the database, not a stale
+        // client-side value that could have changed between the findMany and
+        // this update.
+        const rows = await tx.$queryRaw<Array<{ stockQuantity: number }>>`
           UPDATE "Variant"
           SET "stockQuantity" = "stockQuantity" - ${item.quantity}
           WHERE "id" = ${item.variantId}
             AND "stockQuantity" >= ${item.quantity}
+          RETURNING "stockQuantity"
         `;
 
-        if (updated !== 1) {
+        if (rows.length !== 1) {
           throw ApiError.outOfStock(
             `Item "${item.title}" (${item.size}/${item.color}) is out of stock or has insufficient stock`
           );
         }
+
+        const newStock = rows[0].stockQuantity;
+        const previousStock = newStock + item.quantity;
 
         await tx.inventoryMovement.create({
           data: {
             variantId: item.variantId,
             type: 'SALE',
             quantity: -item.quantity,
-            previousStock: variant.stockQuantity,
-            newStock: variant.stockQuantity - item.quantity,
+            previousStock,
+            newStock,
             reason: `POS Sale Receipt #${receiptNumber}`,
             referenceType: 'POS_SALE',
             referenceId: receiptNumber,
@@ -813,6 +820,29 @@ router.get('/audit-logs', requireAdmin, requireRole('OWNER'), async (_req: AuthR
   try {
     const logs = await db.auditLog.findMany({ orderBy: { createdAt: 'desc' }, take: 100 });
     res.json(logs);
+  } catch (error) {
+    next(error);
+  }
+});
+
+// ── GET /api/pos/sessions ──────────────────────────────────────────────────
+// Admin: list active POS sessions so the monitoring dashboard shows real data.
+router.get('/sessions', requireAdmin, requireRole('OWNER'), async (_req: AuthRequest, res: Response, next: NextFunction) => {
+  try {
+    const sessions = await db.posSession.findMany({
+      where: { status: 'ACTIVE', expiresAt: { gt: new Date() } },
+      orderBy: { startTime: 'desc' },
+      select: {
+        id: true,
+        cashierId: true,
+        cashierName: true,
+        approvedBy: true,
+        status: true,
+        startTime: true,
+        expiresAt: true,
+      },
+    });
+    res.json({ success: true, sessions });
   } catch (error) {
     next(error);
   }

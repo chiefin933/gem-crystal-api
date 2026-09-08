@@ -21,6 +21,12 @@ const app = express();
 const PORT = Number(process.env.PORT) || 4000;
 app.disable('x-powered-by');
 
+// Trust exactly one proxy hop (Render, Nginx, etc.) so express-rate-limit
+// reads the real client IP from X-Forwarded-For rather than the proxy IP.
+// Only set this when actually deployed behind a proxy — set to false or 0
+// for direct (no-proxy) deployments.
+app.set('trust proxy', process.env.NODE_ENV === 'production' ? 1 : false);
+
 // ── Security & Performance Middleware ─────────────────────────────────────
 app.use(helmet());
 app.use(compression());
@@ -93,6 +99,17 @@ app.use(express.urlencoded({ extended: true, limit: '16kb', parameterLimit: 100 
 // ── Routes ─────────────────────────────────────────────────────────────────
 app.get('/api/health', (_req, res) => {
   res.json({ status: 'ok', time: new Date().toISOString(), service: 'Gem & Crystal API v1' });
+});
+
+// Readiness probe — verifies the database connection is live.
+// Use this for container/deployment health checks, not just liveness.
+app.get('/api/health/ready', async (_req, res) => {
+  try {
+    await prisma.$queryRaw`SELECT 1`;
+    res.json({ status: 'ready', db: 'connected', time: new Date().toISOString() });
+  } catch {
+    res.status(503).json({ status: 'not_ready', db: 'unreachable', time: new Date().toISOString() });
+  }
 });
 
 app.use('/api/products', productsRouter);

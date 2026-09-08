@@ -285,26 +285,40 @@ router.patch('/variant/stock', requireAdmin, requireRole('OWNER'), async (req: A
 
   try {
     const result = await prisma.$transaction(async (tx) => {
-      // Lock the row and read current stock inside the transaction
-      const variant = await tx.variant.findUnique({ where: { id: variantId } });
-      if (!variant) throw new ApiError(404, 'NOT_FOUND', 'Variant not found');
+      // Atomic conditional update — the database enforces the invariant.
+      // For positive delta (restock): always succeeds.
+      // For negative delta (deduction): only succeeds when stock >= |delta|,
+      //   preventing silent clamp-to-zero that would hide inventory errors.
+      const rows = await tx.$queryRaw<Array<{ id: string; sku: string; stockQuantity: number }>>`
+        UPDATE "Variant"
+        SET "stockQuantity" = "stockQuantity" + ${delta}
+        WHERE "id" = ${variantId}
+          AND "stockQuantity" + ${delta} >= 0
+        RETURNING "id", "sku", "stockQuantity"
+      `;
 
-      const previousStock = variant.stockQuantity;
-      const newStock = Math.max(0, previousStock + delta);
-      const actualDelta = newStock - previousStock; // may differ from delta if clamped at 0
+      if (rows.length !== 1) {
+        // Either the variant doesn't exist or the adjustment would go negative
+        const exists = await tx.variant.findUnique({
+          where: { id: variantId },
+          select: { stockQuantity: true },
+        });
+        if (!exists) throw new ApiError(404, 'NOT_FOUND', 'Variant not found');
+        throw new ApiError(400, 'OUT_OF_STOCK',
+          `Adjustment of ${delta} would bring stock below zero (current: ${exists.stockQuantity}). ` +
+          `Use a smaller delta or restock first.`,
+        );
+      }
 
-      // Atomic stock update
-      const updated = await tx.variant.update({
-        where: { id: variantId },
-        data: { stockQuantity: newStock },
-      });
+      const newStock = rows[0].stockQuantity;
+      const previousStock = newStock - delta; // delta already applied, reverse to get previous
+      const sku = rows[0].sku;
 
-      // Record every movement for accountability
       await (tx as any).inventoryMovement.create({
         data: {
           variantId,
           type: 'ADJUSTMENT',
-          quantity: actualDelta,
+          quantity: delta,
           previousStock,
           newStock,
           reason,
@@ -313,17 +327,16 @@ router.patch('/variant/stock', requireAdmin, requireRole('OWNER'), async (req: A
         },
       });
 
-      // Full audit trail so the owner can trace who changed what
       await (tx as any).auditLog.create({
         data: {
           actor,
           action: 'INVENTORY_ADJUSTED',
           details: JSON.stringify({
             variantId,
-            sku: variant.sku,
+            sku,
             previousStock,
             requestedDelta: delta,
-            actualDelta,
+            actualDelta: delta,
             newStock,
             reason,
           }),
@@ -331,10 +344,9 @@ router.patch('/variant/stock', requireAdmin, requireRole('OWNER'), async (req: A
         },
       });
 
-      return { updated, previousStock, newStock, sku: variant.sku };
+      return { id: rows[0].id, sku, previousStock, newStock, stockQuantity: newStock };
     });
 
-    // Emit after the transaction commits — listeners must not throw
     setImmediate(() => eventBus.emit('InventoryAdjusted', {
       variantId,
       sku: result.sku,
@@ -344,7 +356,7 @@ router.patch('/variant/stock', requireAdmin, requireRole('OWNER'), async (req: A
       actor,
     }));
 
-    res.json({ success: true, data: result.updated });
+    res.json({ success: true, data: result });
   } catch (error) {
     if (error instanceof ApiError) throw error;
     throw ApiError.internal('Failed to adjust stock');

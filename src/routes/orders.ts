@@ -43,6 +43,9 @@ const CheckoutSchema = z.object({
     quantity: z.number().int().positive().max(20),
   }).strict()).min(1).max(25),
   couponCode: z.string().trim().toUpperCase().regex(/^[A-Z0-9_-]{3,32}$/).optional(),
+  // CARD is structurally accepted in the schema to preserve the type model,
+  // but the route handler rejects it before any transaction until a gateway
+  // is integrated. This keeps the frontend type valid while blocking fake payments.
   paymentMethod: z.enum(['MPESA', 'CARD']),
   mpesaPhone: z.string().trim().regex(/^\+?[0-9]{9,15}$/, 'Enter a valid M-PESA phone number').optional(),
 }).strict().superRefine((data, ctx) => {
@@ -193,6 +196,23 @@ router.post('/', async (req: Request, res: Response, next: NextFunction) => {
 
     const orderNumber = newOrderNumber();
     const trackingToken = crypto.randomBytes(32).toString('base64url');
+
+    // ── Pre-transaction gates ─────────────────────────────────────────────
+    // Reject before touching the database so no stock is deducted.
+
+    if (data.paymentMethod === 'CARD') {
+      // Card gateway is not yet integrated. Rejecting here ensures stock is
+      // never reserved against a payment that cannot be collected.
+      throw new ApiError(503, 'PAYMENT_FAILED',
+        'Card payments are not yet available. Please pay via M-PESA.',
+      );
+    }
+
+    if (data.paymentMethod === 'MPESA' && !isMpesaConfigured()) {
+      throw new ApiError(503, 'PAYMENT_FAILED',
+        'M-PESA payments are temporarily unavailable. Please try again later.',
+      );
+    }
 
     const order = await prisma.$transaction(async tx => {
       const variants = await tx.variant.findMany({
