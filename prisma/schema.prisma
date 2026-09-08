@@ -114,7 +114,7 @@ model Admin {
   passwordHash     String
   name             String
   role             String            @default("OWNER")
-  pinCode          String            @default("1234")
+  pinCode          String            @default("")
   createdAt        DateTime          @default(now())
   posLoginRequests PosLoginRequest[]
 }

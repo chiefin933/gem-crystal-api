@@ -69,7 +69,10 @@ const pinLimiter = rateLimit({
 // ── POS auth request schema ────────────────────────────────────────────────
 const PosAuthRequestSchema = z.object({
   cashierName: z.string().trim().min(2, 'Cashier name is required').max(120),
-  pinCode:     z.string().trim().min(4, 'PIN must be at least 4 digits').max(12),
+  // Digits only — a PIN must be numeric, 4–12 characters.
+  // This prevents accidentally setting alphabetic passwords as PINs and
+  // ensures the bcrypt comparison is always against a numeric secret.
+  pinCode:     z.string().trim().regex(/^\d{4,12}$/, 'PIN must be 4–12 digits'),
   deviceId:    z.string().trim().max(100).optional(),
   biometricId: z.string().trim().max(200).optional(),
 }).strict();
@@ -590,7 +593,7 @@ router.post('/checkout', requirePosSession, async (req: Request, res: Response, 
       throw ApiError.badRequest('Cash received is less than the sale total');
     }
 
-    const receiptNumber = offlineReceiptId || ('GC-POS-' + Date.now().toString().slice(-6));
+    const receiptNumber = offlineReceiptId || ('GC-POS-' + crypto.randomBytes(5).toString('hex').toUpperCase());
     const finalCustomerName = customerName || 'Walk-in Customer';
     const normalizedPhone = customerPhone ? normalizeMpesaPhone(String(customerPhone)) : null;
     if (finalPaymentMethod === 'MPESA' && (!normalizedPhone || !isMpesaConfigured())) {

@@ -61,12 +61,13 @@ router.post('/login', async (req: Request, res: Response) => {
 
     const token = generateToken(admin.id, admin.email, admin.role as 'OWNER' | 'CASHIER');
 
+    // Return token and admin at the top level so both the Admin and POS
+    // frontends can read res.token / res.admin directly without unwrapping
+    // a nested data object. success:true is kept for API consistency.
     res.json({
       success: true,
-      data: {
-        token,
-        admin: { id: admin.id, email: admin.email, name: admin.name, role: admin.role },
-      },
+      token,
+      admin: { id: admin.id, email: admin.email, name: admin.name, role: admin.role },
     });
   } catch (error) {
     console.error('Admin login error:', error);
