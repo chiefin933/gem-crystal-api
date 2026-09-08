@@ -6,6 +6,12 @@ import { generateToken, requireAdmin, requireRole, AuthRequest } from '../middle
 
 const router = Router();
 
+/** Convert Prisma Decimal or number to plain JS number. */
+function toNum(v: { toNumber(): number } | number | null | undefined): number {
+  if (v == null) return 0;
+  return typeof v === 'object' ? v.toNumber() : Number(v);
+}
+
 // ── Validation schema ─────────────────────────────────────────────────────
 const AdminLoginSchema = z.object({
   email: z
@@ -121,7 +127,7 @@ router.get('/stats', requireAdmin, requireRole('OWNER'), async (_req: AuthReques
       prisma.coupon.count({ where: { isActive: true } }),
     ]);
 
-    const totalRevenue = paidOrders.reduce((sum, o) => sum + o.total, 0);
+    const totalRevenue = paidOrders.reduce((sum, o) => sum + toNum(o.total), 0);
     const avgOrderValue = paidOrders.length > 0 ? totalRevenue / paidOrders.length : 0;
 
     // Revenue by payment method
@@ -134,6 +140,9 @@ router.get('/stats', requireAdmin, requireRole('OWNER'), async (_req: AuthReques
       _sum: { total: true },
     });
 
+    const mpesaRevenue: number = toNum(mpesaOrders._sum.total);
+    const cardRevenue: number = toNum(cardOrders._sum.total);
+
     res.json({
       totalProducts,
       totalOrders,
@@ -141,8 +150,8 @@ router.get('/stats', requireAdmin, requireRole('OWNER'), async (_req: AuthReques
       pendingOrders,
       avgOrderValue,
       activeCoupons: coupons,
-      mpesaRevenue: mpesaOrders._sum.total || 0,
-      cardRevenue: cardOrders._sum.total || 0,
+      mpesaRevenue,
+      cardRevenue,
       lowStockVariants: lowStockVariants.map(v => ({
         variantId: v.id,
         sku: v.sku,

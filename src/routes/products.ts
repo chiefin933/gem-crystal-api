@@ -2,6 +2,7 @@ import { Router, Request, Response } from 'express';
 import { prisma } from '../lib/prisma';
 import { requireAdmin, requireRole, AuthRequest } from '../middleware/auth';
 import { ApiError } from '../lib/ApiError';
+import { eventBus } from '../events/EventBus';
 import { z } from 'zod';
 
 const router = Router();
@@ -104,8 +105,7 @@ const ProductSchema = z.object({
   gender: z.enum(['women', 'men', 'unisex']),
   category: z.string().min(1),
   price: z.number().positive(),
-  salePrice: z.number().positive().optional(),
-  description: z.string().default(''),
+  salePrice: z.number().positive().optional(),  description: z.string().default(''),
   fabricCare: z.string().default('Premium material blend. Hand wash or dry clean recommended.'),
   images: z.array(z.string().url()).min(1),
   sizes: z.array(z.string()).min(1),
@@ -331,10 +331,20 @@ router.patch('/variant/stock', requireAdmin, requireRole('OWNER'), async (req: A
         },
       });
 
-      return updated;
+      return { updated, previousStock, newStock, sku: variant.sku };
     });
 
-    res.json({ success: true, data: result });
+    // Emit after the transaction commits — listeners must not throw
+    setImmediate(() => eventBus.emit('InventoryAdjusted', {
+      variantId,
+      sku: result.sku,
+      previousStock: result.previousStock,
+      newStock: result.newStock,
+      reason,
+      actor,
+    }));
+
+    res.json({ success: true, data: result.updated });
   } catch (error) {
     if (error instanceof ApiError) throw error;
     throw ApiError.internal('Failed to adjust stock');

@@ -7,6 +7,17 @@ import { prisma } from '../lib/prisma';
 import { ApiError } from '../lib/ApiError';
 import { AuthRequest, requireAdmin, requireRole } from '../middleware/auth';
 import { initiateMpesaStkPush, isMpesaConfigured, normalizeMpesaPhone, classifyMpesaInitiationError } from '../services/mpesa';
+import { eventBus } from '../events/EventBus';
+
+/**
+ * toNum — converts a Prisma Decimal (or plain number) to a JS number.
+ * Required because schema.prisma Decimal fields return Decimal objects at
+ * runtime; all JS arithmetic and comparisons need plain numbers.
+ */
+function toNum(v: { toNumber(): number } | number | null | undefined): number {
+  if (v == null) return 0;
+  return typeof v === 'object' ? v.toNumber() : Number(v);
+}
 
 const router = Router();
 // Prisma Client is regenerated after the schema change. Keep this route compatible
@@ -151,7 +162,7 @@ router.get('/payment-notifications', requirePosSession, async (_req: Request, re
         orderNumber: n.paymentReference,
         customerName: n.customerName,
         customerPhone: n.customerPhone,
-        amount: n.amount,
+        amount: n.amount instanceof Object ? n.amount.toNumber() : n.amount,
         currency: n.currency,
         paymentMethod: n.paymentMethod,
         mpesaReceipt: n.mpesaReceipt,
@@ -565,7 +576,7 @@ router.post('/checkout', requirePosSession, async (req: Request, res: Response, 
         sku: variant.sku,
         size: variant.size,
         color: variant.color,
-        price: variant.salePrice ?? variant.price,
+        price: toNum(variant.salePrice ?? variant.price),
         quantity,
         image: JSON.parse(variant.product.images || '[]')[0] || '',
       };
@@ -589,8 +600,7 @@ router.post('/checkout', requirePosSession, async (req: Request, res: Response, 
         'BAD_REQUEST',
       );
     }
-    if (finalPaymentMethod === 'CASH' && Number(cashReceived) < serverTotal) {
-      throw ApiError.badRequest('Cash received is less than the sale total');
+    if (finalPaymentMethod === 'CASH' && Number(cashReceived) < serverTotal) {      throw ApiError.badRequest('Cash received is less than the sale total');
     }
 
     const receiptNumber = offlineReceiptId || ('GC-POS-' + crypto.randomBytes(5).toString('hex').toUpperCase());
@@ -662,8 +672,7 @@ router.post('/checkout', requirePosSession, async (req: Request, res: Response, 
           paymentMethod: finalPaymentMethod,
           paymentStatus: finalPaymentMethod === 'MPESA' ? 'PENDING' : 'PAID',
           cashReceived: finalPaymentMethod === 'CASH' ? Number(cashReceived) : null,
-          changeGiven: finalPaymentMethod === 'CASH' ? Math.max(0, Number(cashReceived) - serverTotal) : null,
-        },
+          changeGiven: finalPaymentMethod === 'CASH' ? Math.max(0, Number(cashReceived) - serverTotal) : null,        },
       });
 
       if (customerPhone) {
@@ -688,12 +697,35 @@ router.post('/checkout', requirePosSession, async (req: Request, res: Response, 
       return createdSale;
     });
 
+    // For CASH sales, emit SaleCreated immediately after the transaction.
+    // MPESA sales emit SaleCreated from the M-PESA callback (after payment confirmation).
+    if (finalPaymentMethod === 'CASH') {
+      setImmediate(() => eventBus.emit('SaleCreated', {
+        receiptNumber: sale.receiptNumber,
+        cashierName: sale.cashierName,
+        customerName: sale.customerName,
+        customerPhone: sale.customerPhone ?? null,
+        total: toNum(sale.total),
+        paymentMethod: sale.paymentMethod,
+        mpesaReceipt: null,
+        items: JSON.parse(sale.items),
+      }));
+    }
+
     let paymentInitiated = false;
     if (finalPaymentMethod === 'MPESA' && normalizedPhone) {
+      // Write idempotency key BEFORE calling Safaricom so any callback that
+      // arrives after a network timeout can still be correlated to this sale.
+      const idempotencyKey = crypto.randomBytes(16).toString('hex');
+      await db.posSale.update({
+        where: { id: sale.id },
+        data: { mpesaIdempotencyKey: idempotencyKey, mpesaInitiatedAt: new Date() },
+      });
+
       try {
         const paymentRequest = await initiateMpesaStkPush({
           orderNumber: sale.receiptNumber,
-          amount: sale.total,
+          amount: toNum(sale.total),
           phone: normalizedPhone,
         });
         paymentInitiated = (await db.posSale.updateMany({
@@ -701,7 +733,6 @@ router.post('/checkout', requirePosSession, async (req: Request, res: Response, 
           data: {
             mpesaCheckoutRequestId: paymentRequest.checkoutRequestId,
             mpesaMerchantRequestId: paymentRequest.merchantRequestId,
-            mpesaInitiatedAt: new Date(),
           },
         })).count === 1;
       } catch (error) {
@@ -732,14 +763,19 @@ router.post('/checkout', requirePosSession, async (req: Request, res: Response, 
         }
 
         // TIMEOUT: outcome is ambiguous — Safaricom may have accepted the STK
-        // before the connection dropped. Leave the sale PENDING so the callback
-        // can still confirm payment. The reconciliation job will expire it if
-        // no callback arrives within the configured window.
+        // before the connection dropped. Mark PENDING_CORRELATION so the owner
+        // and reconciliation job can distinguish it from a normal pending payment.
+        // The idempotency key written above ensures any arriving callback can
+        // still be matched even without the CheckoutRequestID.
+        await db.posSale.updateMany({
+          where: { id: sale.id, paymentStatus: 'PENDING' },
+          data: { paymentStatus: 'PENDING_CORRELATION' },
+        });
         await db.auditLog.create({
           data: {
             actor: session.cashierName,
             action: 'PAYMENT_PENDING',
-            details: `M-PESA STK timed out for receipt #${sale.receiptNumber}. Awaiting callback or reconciliation.`,
+            details: `M-PESA STK timed out for receipt #${sale.receiptNumber}. Marked PENDING_CORRELATION — awaiting callback or reconciliation.`,
           },
         });
         // Return success=true with paymentInitiated=false — the POS should

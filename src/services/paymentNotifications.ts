@@ -5,7 +5,7 @@ type ConfirmedPayment = {
   paymentReference: string;
   customerName: string;
   customerPhone: string | null;
-  total: number;
+  total: number | { toNumber(): number };
   currency: string;
   paymentMethod: string;
   mpesaReceipt?: string | null;
@@ -16,6 +16,11 @@ type ConfirmedPayment = {
  * and written by the backend. The unique order id makes provider callback
  * retries safe and prevents duplicate cashier pop-ups.
  */
+function toNum(v: { toNumber(): number } | number | null | undefined): number {
+  if (v == null) return 0;
+  return typeof v === 'object' ? v.toNumber() : Number(v);
+}
+
 export async function queueOrderPaymentNotification(db: PrismaClient | any, order: ConfirmedPayment): Promise<void> {
   if (order.paymentMethod !== 'MPESA') return;
 
@@ -23,14 +28,14 @@ export async function queueOrderPaymentNotification(db: PrismaClient | any, orde
     where: { orderId: order.id },
     update: {
       mpesaReceipt: order.mpesaReceipt || null,
-      amount: order.total,
+      amount: toNum(order.total),
     },
     create: {
       orderId: order.id,
       paymentReference: order.paymentReference,
       customerName: order.customerName,
       customerPhone: order.customerPhone || '',
-      amount: order.total,
+      amount: toNum(order.total),
       currency: order.currency,
       paymentMethod: order.paymentMethod,
       mpesaReceipt: order.mpesaReceipt || null,
@@ -43,13 +48,13 @@ export async function queuePosSalePaymentNotification(db: PrismaClient | any, sa
 
   await db.paymentNotification.upsert({
     where: { posSaleId: sale.id },
-    update: { mpesaReceipt: sale.mpesaReceipt || null, amount: sale.total },
+    update: { mpesaReceipt: sale.mpesaReceipt || null, amount: toNum(sale.total) },
     create: {
       posSaleId: sale.id,
       paymentReference: sale.paymentReference,
       customerName: sale.customerName,
       customerPhone: sale.customerPhone || '',
-      amount: sale.total,
+      amount: toNum(sale.total),
       currency: sale.currency,
       paymentMethod: sale.paymentMethod,
       mpesaReceipt: sale.mpesaReceipt || null,

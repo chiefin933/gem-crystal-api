@@ -5,6 +5,7 @@ import { prisma } from '../lib/prisma';
 import { ApiError } from '../lib/ApiError';
 import { requireAdmin, requireRole, AuthRequest } from '../middleware/auth';
 import { queueOrderPaymentNotification, queuePosSalePaymentNotification } from '../services/paymentNotifications';
+import { eventBus } from '../events/EventBus';
 import {
   callbackSecretMatches,
   classifyMpesaInitiationError,
@@ -14,6 +15,16 @@ import {
 } from '../services/mpesa';
 
 const router = Router();
+
+/**
+ * toNum — safely converts a Prisma Decimal (or plain number) to a JS number.
+ * Prisma Decimal fields serialize as Decimal objects at runtime; they must be
+ * converted before any JS arithmetic or comparison.
+ */
+function toNum(v: { toNumber(): number } | number | null | undefined): number {
+  if (v == null) return 0;
+  return typeof v === 'object' ? v.toNumber() : Number(v);
+}
 
 const CustomerSchema = z.object({
   fullName: z.string().trim().min(2).max(120),
@@ -75,6 +86,8 @@ function newOrderNumber(): string {
 }
 
 function roundMoney(value: number): number {
+  // Round to 2 decimal places using the "round half away from zero" rule.
+  // toFixed(2) then back to number avoids floating-point drift.
   return Number(value.toFixed(2));
 }
 
@@ -204,7 +217,7 @@ router.post('/', async (req: Request, res: Response, next: NextFunction) => {
         if (!variant || !variant.product.isActive) {
           throw ApiError.badRequest('One or more selected products are no longer available');
         }
-        const price = variant.salePrice ?? variant.price;
+        const price = toNum(variant.salePrice ?? variant.price);
         return {
           productId: variant.productId,
           variantId: variant.id,
@@ -227,12 +240,14 @@ router.post('/', async (req: Request, res: Response, next: NextFunction) => {
         if (!coupon || !coupon.isActive || expired || coupon.usageCount >= coupon.usageLimit) {
           throw ApiError.badRequest('This promo code is not available');
         }
-        if (subtotal < coupon.minOrderAmount) {
-          throw ApiError.badRequest(`This promo code requires a minimum order of KES ${coupon.minOrderAmount.toLocaleString()}`);
+        if (subtotal < toNum(coupon.minOrderAmount)) {
+          throw ApiError.badRequest(`This promo code requires a minimum order of KES ${toNum(coupon.minOrderAmount).toLocaleString()}`);
         }
         couponCode = coupon.code;
         discount = roundMoney(Math.min(
-          coupon.discountType === 'PERCENTAGE' ? (subtotal * coupon.discountValue) / 100 : coupon.discountValue,
+          coupon.discountType === 'PERCENTAGE'
+            ? (subtotal * toNum(coupon.discountValue)) / 100
+            : toNum(coupon.discountValue),
           subtotal,
         ));
       }
@@ -331,12 +346,35 @@ router.post('/', async (req: Request, res: Response, next: NextFunction) => {
       });
     });
 
+    // Emit OrderCreated after the transaction commits — never inside it.
+    eventBus.emit('OrderCreated', {
+      orderId: order.id,
+      orderNumber: order.orderNumber,
+      customerName: order.customerName,
+      customerPhone: order.customerPhone,
+      total: toNum(order.total),
+      paymentMethod: order.paymentMethod,
+    });
+
     let paymentInitiated = false;
     if (data.paymentMethod === 'MPESA' && data.mpesaPhone && isMpesaConfigured()) {
+      // Generate a unique idempotency key and persist it BEFORE calling
+      // Safaricom. If the HTTP connection drops after Daraja accepts the
+      // request but before we receive the response, the key lets us
+      // correlate any callback that still arrives.
+      const idempotencyKey = crypto.randomBytes(16).toString('hex');
+      await prisma.order.update({
+        where: { id: order.id },
+        data: {
+          mpesaIdempotencyKey: idempotencyKey,
+          mpesaInitiatedAt: new Date(),
+        },
+      });
+
       try {
         const paymentRequest = await initiateMpesaStkPush({
           orderNumber: order.orderNumber,
-          amount: order.total,
+          amount: toNum(order.total),
           phone: data.mpesaPhone,
         });
         const saved = await prisma.order.updateMany({
@@ -344,7 +382,6 @@ router.post('/', async (req: Request, res: Response, next: NextFunction) => {
           data: {
             mpesaCheckoutRequestId: paymentRequest.checkoutRequestId,
             mpesaMerchantRequestId: paymentRequest.merchantRequestId,
-            mpesaInitiatedAt: new Date(),
           },
         });
         paymentInitiated = saved.count === 1;
@@ -376,11 +413,15 @@ router.post('/', async (req: Request, res: Response, next: NextFunction) => {
         }
 
         // TIMEOUT: ambiguous — leave PENDING for callback or reconciliation.
+        await prisma.order.updateMany({
+          where: { id: order.id, paymentStatus: 'PENDING' },
+          data: { paymentStatus: 'PENDING_CORRELATION' },
+        });
         await prisma.auditLog.create({
           data: {
             actor: 'Storefront checkout',
             action: 'PAYMENT_PENDING',
-            details: `M-PESA STK timed out for order #${order.orderNumber}. Awaiting callback or reconciliation.`,
+            details: `M-PESA STK timed out for order #${order.orderNumber}. Marked PENDING_CORRELATION — awaiting callback or reconciliation. idempotencyKey recorded.`,
             ipAddress: req.ip,
           },
         });
@@ -459,14 +500,19 @@ router.post('/mpesa-callback', async (req: Request, res: Response, next: NextFun
 
       if (callback.ResultCode !== 0) {
         const failed = order
-          ? await tx.order.updateMany({ where: { id: order.id, paymentStatus: 'PENDING' }, data: { paymentStatus: 'FAILED' } })
-          : await tx.posSale.updateMany({ where: { id: sale!.id, paymentStatus: 'PENDING' }, data: { paymentStatus: 'FAILED' } });
+          ? await tx.order.updateMany({ where: { id: order.id, paymentStatus: { in: ['PENDING', 'PENDING_CORRELATION'] } }, data: { paymentStatus: 'FAILED' } })
+          : await tx.posSale.updateMany({ where: { id: sale!.id, paymentStatus: { in: ['PENDING', 'PENDING_CORRELATION'] } }, data: { paymentStatus: 'FAILED' } });
         if (failed.count === 1) {
           if (order) await releaseFailedOrderReservation(tx, order, `M-PESA payment failed for order #${reference}`);
           else await releaseFailedPosSaleReservation(tx, sale, `M-PESA payment failed for POS receipt #${reference}`);
           await tx.auditLog.create({
             data: { actor: 'M-PESA payment service', action: 'PAYMENT_FAILED', details: `Payment #${reference}: ${callback.ResultDesc}`, ipAddress: req.ip },
           });
+          setImmediate(() => eventBus.emit('PaymentFailed', {
+            reference: reference!,
+            type: order ? 'ORDER' : 'POS_SALE',
+            reason: callback.ResultDesc,
+          }));
         }
         return { accepted: true, message: 'Payment result received' };
       }
@@ -481,7 +527,7 @@ router.post('/mpesa-callback', async (req: Request, res: Response, next: NextFun
 
       if (
         typeof receipt !== 'string' || receipt.trim().length < 3 || receipt.length > 100 ||
-        !Number.isFinite(paidAmount) || Math.abs(paidAmount - payment.total) > 0.01 ||
+        !Number.isFinite(paidAmount) || Math.abs(paidAmount - toNum(payment.total)) > 0.01 ||
         !paidPhone || !normalizedExpectedPhone || paidPhone !== normalizedExpectedPhone
       ) {
         await tx.auditLog.create({
@@ -493,14 +539,38 @@ router.post('/mpesa-callback', async (req: Request, res: Response, next: NextFun
       if (payment.paymentStatus === 'PAID') {
         return { accepted: payment.mpesaReceipt === receipt.trim(), message: payment.mpesaReceipt === receipt.trim() ? 'Payment was already recorded' : 'Conflicting receipt' };
       }
-      if (payment.paymentStatus !== 'PENDING') return { accepted: false, message: 'Payment cannot be accepted' };
+      if (!['PENDING', 'PENDING_CORRELATION'].includes(payment.paymentStatus)) return { accepted: false, message: 'Payment cannot be accepted' };
 
       if (order) {
         const paid = await tx.order.update({ where: { id: order.id }, data: { paymentStatus: 'PAID', mpesaReceipt: receipt.trim() } });
         await queueOrderPaymentNotification(tx, { ...paid, paymentReference: paid.orderNumber });
+        // Emit after the transaction — listener wrapped in try/catch so it can never roll back the payment
+        setImmediate(() => eventBus.emit('OrderPaid', {
+          orderId: paid.id,
+          orderNumber: paid.orderNumber,
+          customerName: paid.customerName,
+          customerPhone: paid.customerPhone,
+          customerAddress: paid.customerAddress,
+          customerTownCity: paid.customerTownCity,
+          customerCounty: paid.customerCounty,
+          total: toNum(paid.total),
+          paymentMethod: paid.paymentMethod,
+          mpesaReceipt: paid.mpesaReceipt,
+          items: JSON.parse(paid.items),
+        }));
       } else {
         const paid = await tx.posSale.update({ where: { id: sale!.id }, data: { paymentStatus: 'PAID', mpesaReceipt: receipt.trim() } });
         await queuePosSalePaymentNotification(tx, { ...paid, paymentReference: paid.receiptNumber, currency: 'KES' });
+        setImmediate(() => eventBus.emit('SaleCreated', {
+          receiptNumber: paid.receiptNumber,
+          cashierName: paid.cashierName,
+          customerName: paid.customerName,
+          customerPhone: paid.customerPhone,
+          total: toNum(paid.total),
+          paymentMethod: paid.paymentMethod,
+          mpesaReceipt: paid.mpesaReceipt,
+          items: JSON.parse(paid.items),
+        }));
       }
       await tx.auditLog.create({
         data: { actor: 'M-PESA payment service', action: 'PAYMENT_CONFIRMED', details: `Payment #${reference} confirmed via M-PESA receipt ${receipt.trim()}`, ipAddress: req.ip },
