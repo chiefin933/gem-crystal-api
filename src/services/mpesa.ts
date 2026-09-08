@@ -151,3 +151,29 @@ export function normalizeMpesaPhone(phone: string): string | null {
     return null;
   }
 }
+
+/**
+ * Classifies an error thrown by initiateMpesaStkPush.
+ *
+ * Returns 'TIMEOUT' when the outcome is ambiguous — the request may have
+ * reached Safaricom before the connection was lost, so the customer could
+ * still receive the STK prompt and pay. The caller must leave the payment
+ * PENDING and wait for the Daraja callback or a reconciliation job.
+ *
+ * Returns 'REJECTED' only when Safaricom or the local config definitively
+ * refused the request (wrong credentials, bad phone number, HTTP 4xx/5xx
+ * with a clear error body, or ResponseCode !== '0'). In this case it is
+ * safe to mark the payment FAILED and restore stock immediately.
+ */
+export function classifyMpesaInitiationError(error: unknown): 'TIMEOUT' | 'REJECTED' {
+  if (error instanceof Error) {
+    // AbortSignal.timeout() throws a DOMException whose name is 'TimeoutError'
+    if (error.name === 'TimeoutError') return 'TIMEOUT';
+    // Node fetch network failures (ECONNRESET, ENOTFOUND, etc.)
+    if (error.name === 'TypeError' && error.message.includes('fetch')) return 'TIMEOUT';
+    // Any other unknown/unexpected error — treat as ambiguous to be safe
+    if (!error.message.includes('M-PESA')) return 'TIMEOUT';
+  }
+  // Errors thrown explicitly by our own mpesa.ts code are definitive
+  return 'REJECTED';
+}

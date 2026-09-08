@@ -7,6 +7,7 @@ import { requireAdmin, requireRole, AuthRequest } from '../middleware/auth';
 import { queueOrderPaymentNotification, queuePosSalePaymentNotification } from '../services/paymentNotifications';
 import {
   callbackSecretMatches,
+  classifyMpesaInitiationError,
   initiateMpesaStkPush,
   isMpesaConfigured,
   normalizeMpesaPhone,
@@ -348,36 +349,42 @@ router.post('/', async (req: Request, res: Response, next: NextFunction) => {
         });
         paymentInitiated = saved.count === 1;
       } catch (error) {
-        // STK Push definitively failed. Mark the order FAILED and restore
-        // stock + coupon so inventory and usage counts can never be
-        // permanently stranded by a provider error.
-        // If the failure was a network timeout (ambiguous), Safaricom's
-        // callback — if it ever arrives — will be rejected because the
-        // order is no longer PENDING, preventing double-payment.
-        console.error(`M-PESA STK initiation failed for ${order.orderNumber}:`, error instanceof Error ? error.message : error);
+        const errorClass = classifyMpesaInitiationError(error);
+        console.error(`M-PESA STK initiation ${errorClass === 'TIMEOUT' ? 'timed out' : 'failed'} for ${order.orderNumber}:`, error instanceof Error ? error.message : error);
 
-        await prisma.$transaction(async (tx) => {
-          await tx.order.updateMany({
-            where: { id: order.id, paymentStatus: 'PENDING' },
-            data: { paymentStatus: 'FAILED' },
+        if (errorClass === 'REJECTED') {
+          // Safaricom definitively refused — safe to fail and restore immediately.
+          await prisma.$transaction(async (tx) => {
+            await tx.order.updateMany({
+              where: { id: order.id, paymentStatus: 'PENDING' },
+              data: { paymentStatus: 'FAILED' },
+            });
+            await releaseFailedOrderReservation(tx, order, `M-PESA STK rejected for order #${order.orderNumber}`);
+            await tx.auditLog.create({
+              data: {
+                actor: 'Storefront checkout',
+                action: 'PAYMENT_FAILED',
+                details: `M-PESA STK rejected for order #${order.orderNumber}. Stock restored. Error: ${error instanceof Error ? error.message : 'unknown'}`,
+                ipAddress: req.ip,
+              },
+            });
           });
-          await releaseFailedOrderReservation(tx, order, `M-PESA STK initiation failed for order #${order.orderNumber}`);
-          await tx.auditLog.create({
-            data: {
-              actor: 'Storefront checkout',
-              action: 'PAYMENT_FAILED',
-              details: `M-PESA STK initiation failed for order #${order.orderNumber}. Stock restored. Error: ${error instanceof Error ? error.message : 'unknown'}`,
-              ipAddress: req.ip,
-            },
-          });
+          throw ApiError.badRequest(
+            'M-PESA payment was rejected. Please try again or contact the shop.',
+            'PAYMENT_FAILED',
+          );
+        }
+
+        // TIMEOUT: ambiguous — leave PENDING for callback or reconciliation.
+        await prisma.auditLog.create({
+          data: {
+            actor: 'Storefront checkout',
+            action: 'PAYMENT_PENDING',
+            details: `M-PESA STK timed out for order #${order.orderNumber}. Awaiting callback or reconciliation.`,
+            ipAddress: req.ip,
+          },
         });
-
-        // Surface a clear error to the storefront so the customer knows
-        // to retry rather than seeing a phantom pending order.
-        throw ApiError.badRequest(
-          'M-PESA payment could not be initiated. Please try again or contact the shop.',
-          'PAYMENT_FAILED',
-        );
+        // paymentInitiated stays false — storefront shows "waiting for M-PESA" state.
       }
     }
 

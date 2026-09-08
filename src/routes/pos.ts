@@ -6,7 +6,7 @@ import { z } from 'zod';
 import { prisma } from '../lib/prisma';
 import { ApiError } from '../lib/ApiError';
 import { AuthRequest, requireAdmin, requireRole } from '../middleware/auth';
-import { initiateMpesaStkPush, isMpesaConfigured, normalizeMpesaPhone } from '../services/mpesa';
+import { initiateMpesaStkPush, isMpesaConfigured, normalizeMpesaPhone, classifyMpesaInitiationError } from '../services/mpesa';
 
 const router = Router();
 // Prisma Client is regenerated after the schema change. Keep this route compatible
@@ -702,34 +702,45 @@ router.post('/checkout', requirePosSession, async (req: Request, res: Response, 
           },
         })).count === 1;
       } catch (error) {
-        // STK Push definitively failed — Safaricom returned an error or the
-        // request timed out before reaching Daraja. We mark the sale FAILED
-        // and restore stock so inventory can never be permanently stranded.
-        // If the failure is a network timeout (ambiguous), the reconciliation
-        // mechanism will catch any callback that Safaricom still delivers.
-        console.error(`M-PESA STK initiation failed for ${sale.receiptNumber}:`, error instanceof Error ? error.message : error);
+        // Classify the error before deciding what to do with stock.
+        const errorClass = classifyMpesaInitiationError(error);
+        console.error(`M-PESA STK initiation ${errorClass === 'TIMEOUT' ? 'timed out' : 'failed'} for ${sale.receiptNumber}:`, error instanceof Error ? error.message : error);
 
-        await db.$transaction(async (tx: any) => {
-          await tx.posSale.updateMany({
-            where: { id: sale.id, paymentStatus: 'PENDING' },
-            data: { paymentStatus: 'FAILED' },
+        if (errorClass === 'REJECTED') {
+          // Safaricom definitively refused the request — safe to fail immediately.
+          await db.$transaction(async (tx: any) => {
+            await tx.posSale.updateMany({
+              where: { id: sale.id, paymentStatus: 'PENDING' },
+              data: { paymentStatus: 'FAILED' },
+            });
+            await releaseFailedPosSaleReservation(tx, sale, `M-PESA STK rejected for receipt #${sale.receiptNumber}`);
+            await tx.auditLog.create({
+              data: {
+                actor: session.cashierName,
+                action: 'PAYMENT_FAILED',
+                details: `M-PESA STK rejected for receipt #${sale.receiptNumber}. Stock restored. Error: ${error instanceof Error ? error.message : 'unknown'}`,
+              },
+            });
           });
-          await releaseFailedPosSaleReservation(tx, sale, `M-PESA STK initiation failed for receipt #${sale.receiptNumber}`);
-          await tx.auditLog.create({
-            data: {
-              actor: session.cashierName,
-              action: 'PAYMENT_FAILED',
-              details: `M-PESA STK initiation failed for receipt #${sale.receiptNumber}. Stock restored. Error: ${error instanceof Error ? error.message : 'unknown'}`,
-            },
-          });
+          throw ApiError.badRequest(
+            'M-PESA payment was rejected. Stock has been released. Please retry or accept cash.',
+            'PAYMENT_FAILED',
+          );
+        }
+
+        // TIMEOUT: outcome is ambiguous — Safaricom may have accepted the STK
+        // before the connection dropped. Leave the sale PENDING so the callback
+        // can still confirm payment. The reconciliation job will expire it if
+        // no callback arrives within the configured window.
+        await db.auditLog.create({
+          data: {
+            actor: session.cashierName,
+            action: 'PAYMENT_PENDING',
+            details: `M-PESA STK timed out for receipt #${sale.receiptNumber}. Awaiting callback or reconciliation.`,
+          },
         });
-
-        // Return a clear error so the POS shows the cashier an actionable message
-        // rather than showing a pending state that will never resolve.
-        throw ApiError.badRequest(
-          'M-PESA payment could not be initiated. Stock has been released. Please retry or accept cash.',
-          'PAYMENT_FAILED',
-        );
+        // Return success=true with paymentInitiated=false — the POS should
+        // show the cashier a "waiting for M-PESA confirmation" state.
       }
     }
 
