@@ -110,10 +110,24 @@ router.get('/me', requireAdmin, async (req: AuthRequest, res: Response) => {
 });
 
 // ── GET /api/admin/stats ──────────────────────────────────────────────────
-// Dashboard KPI stats
+// Dashboard KPI stats — covers the ENTIRE boutique (ecommerce + POS)
 router.get('/stats', requireAdmin, requireRole('OWNER'), async (_req: AuthRequest, res: Response) => {
   try {
-    const [totalProducts, totalOrders, paidOrders, pendingOrders, lowStockVariants, coupons] = await Promise.all([
+    const [
+      totalProducts,
+      totalOrders,
+      paidOrders,
+      pendingOrders,
+      lowStockVariants,
+      coupons,
+      // POS sales aggregates
+      posPaidSales,
+      posMpesaAgg,
+      posCashAgg,
+      // Ecommerce aggregates by payment method
+      ecomMpesaAgg,
+      ecomCardAgg,
+    ] = await Promise.all([
       prisma.product.count({ where: { isActive: true } }),
       prisma.order.count(),
       prisma.order.findMany({ where: { paymentStatus: 'PAID' }, select: { total: true } }),
@@ -125,33 +139,54 @@ router.get('/stats', requireAdmin, requireRole('OWNER'), async (_req: AuthReques
         take: 20,
       }),
       prisma.coupon.count({ where: { isActive: true } }),
+      // POS paid sales
+      (prisma as any).posSale.findMany({ where: { paymentStatus: 'PAID' }, select: { total: true } }),
+      (prisma as any).posSale.aggregate({ where: { paymentMethod: 'MPESA', paymentStatus: 'PAID' }, _sum: { total: true } }),
+      (prisma as any).posSale.aggregate({ where: { paymentMethod: 'CASH', paymentStatus: 'PAID' }, _sum: { total: true } }),
+      // Ecommerce by method
+      prisma.order.aggregate({ where: { paymentMethod: 'MPESA', paymentStatus: 'PAID' }, _sum: { total: true } }),
+      prisma.order.aggregate({ where: { paymentMethod: 'CARD', paymentStatus: 'PAID' }, _sum: { total: true } }),
     ]);
 
-    const totalRevenue = paidOrders.reduce((sum, o) => sum + toNum(o.total), 0);
-    const avgOrderValue = paidOrders.length > 0 ? totalRevenue / paidOrders.length : 0;
+    // Ecommerce revenue
+    const ecomRevenue = paidOrders.reduce((sum, o) => sum + toNum(o.total), 0);
+    const avgOrderValue = paidOrders.length > 0 ? ecomRevenue / paidOrders.length : 0;
 
-    // Revenue by payment method
-    const mpesaOrders = await prisma.order.aggregate({
-      where: { paymentMethod: 'MPESA', paymentStatus: 'PAID' },
-      _sum: { total: true },
-    });
-    const cardOrders = await prisma.order.aggregate({
-      where: { paymentMethod: 'CARD', paymentStatus: 'PAID' },
-      _sum: { total: true },
-    });
+    // POS revenue
+    const posRevenue: number = posPaidSales.reduce((sum: number, s: any) => sum + toNum(s.total), 0);
 
-    const mpesaRevenue: number = toNum(mpesaOrders._sum.total);
-    const cardRevenue: number = toNum(cardOrders._sum.total);
+    // Combined totals
+    const totalRevenue = ecomRevenue + posRevenue;
+
+    // Payment method breakdown (ecommerce + POS combined)
+    const ecomMpesa: number = toNum(ecomMpesaAgg._sum.total);
+    const ecomCard: number  = toNum(ecomCardAgg._sum.total);
+    const posMpesa: number  = toNum(posMpesaAgg._sum.total);
+    const posCash:  number  = toNum(posCashAgg._sum.total);
 
     res.json({
+      // Product / order counts
       totalProducts,
       totalOrders,
-      totalRevenue,
       pendingOrders,
       avgOrderValue,
       activeCoupons: coupons,
-      mpesaRevenue,
-      cardRevenue,
+
+      // Revenue — full business picture
+      totalRevenue,          // ecommerce + POS combined
+      ecomRevenue,           // online storefront only
+      posRevenue,            // in-store POS only
+
+      // Payment method breakdown across all channels
+      mpesaRevenue: ecomMpesa + posMpesa,   // total M-PESA across both channels
+      cashRevenue:  posCash,                // cash (POS only)
+      cardRevenue:  ecomCard,               // card (ecommerce; currently 0)
+
+      // Per-channel breakdown for the dashboard cards
+      ecomMpesaRevenue: ecomMpesa,
+      posMpesaRevenue:  posMpesa,
+      posCashRevenue:   posCash,
+
       lowStockVariants: lowStockVariants.map(v => ({
         variantId: v.id,
         sku: v.sku,

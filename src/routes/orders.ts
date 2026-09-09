@@ -670,6 +670,16 @@ router.put('/:id', requireAdmin, requireRole('OWNER'), async (req: AuthRequest, 
 // Admin: manually override an order's payment status.
 // Every override requires an explicit reason and creates an AuditLog.
 // FAILED override restores stock; PAID override queues the cashier notification.
+//
+// Enforced state machine — only these transitions are permitted:
+//   PENDING             → PAID, FAILED
+//   PENDING_CORRELATION → PAID, FAILED
+//   PAID                → (no manual transitions — payment is final)
+//   FAILED              → (no direct PAID — stock was already restored;
+//                          re-buying requires a fresh order)
+//
+// Blocking FAILED → PAID prevents a ghost sale where stock was restored
+// but the system records the order as paid without re-deducting inventory.
 router.post('/:id/payment-override', requireAdmin, requireRole('OWNER'), async (req: AuthRequest, res: Response, next: NextFunction) => {
   try {
     const parsed = PaymentOverrideSchema.safeParse(req.body);
@@ -677,25 +687,42 @@ router.post('/:id/payment-override', requireAdmin, requireRole('OWNER'), async (
       throw ApiError.badRequest('Validation failed', 'BAD_REQUEST', parsed.error.flatten());
     }
 
-    const { paymentStatus, reason } = parsed.data;
+    const { paymentStatus: targetStatus, reason } = parsed.data;
     const actor = req.adminEmail || req.adminId || 'OWNER';
 
     const order = await prisma.$transaction(async (tx) => {
       const existing = await tx.order.findUnique({ where: { id: req.params.id } });
       if (!existing) throw ApiError.notFound('Order not found');
 
-      if (existing.paymentStatus === paymentStatus) {
-        throw ApiError.badRequest(`Order is already in ${paymentStatus} state`);
+      // Enforce allowed transition matrix
+      const from = existing.paymentStatus;
+      const ALLOWED: Record<string, string[]> = {
+        'PENDING':             ['PAID', 'FAILED'],
+        'PENDING_CORRELATION': ['PAID', 'FAILED'],
+        'PAID':                [],
+        'FAILED':              [],
+      };
+
+      const allowedTargets = ALLOWED[from] ?? [];
+      if (!allowedTargets.includes(targetStatus)) {
+        throw ApiError.badRequest(
+          `Cannot transition payment from ${from} to ${targetStatus}. ` +
+          (allowedTargets.length
+            ? `Allowed: ${allowedTargets.join(', ')}.`
+            : `${from} orders cannot be manually overridden.`),
+          'BAD_REQUEST',
+        );
       }
 
       const updated = await tx.order.update({
         where: { id: req.params.id },
-        data: { paymentStatus },
+        data: { paymentStatus: targetStatus },
       });
 
-      // Restore stock when manually marking an order FAILED
-      if (paymentStatus === 'FAILED' && existing.paymentStatus !== 'FAILED') {
-        await releaseFailedOrderReservation(tx, existing, `Manual payment override: ${reason}`);
+      // Restore stock when manually marking FAILED — consistent with
+      // the automatic M-PESA failure path
+      if (targetStatus === 'FAILED') {
+        await releaseFailedOrderReservation(tx, existing, `Manual payment override to FAILED: ${reason}`);
       }
 
       await tx.auditLog.create({
@@ -704,8 +731,8 @@ router.post('/:id/payment-override', requireAdmin, requireRole('OWNER'), async (
           action: 'PAYMENT_STATUS_OVERRIDDEN',
           details: JSON.stringify({
             orderNumber: existing.orderNumber,
-            from: existing.paymentStatus,
-            to: paymentStatus,
+            from,
+            to: targetStatus,
             reason,
           }),
           ipAddress: req.ip,
@@ -715,8 +742,8 @@ router.post('/:id/payment-override', requireAdmin, requireRole('OWNER'), async (
       return updated;
     });
 
-    // Notify cashier if manually marking PAID (e.g. cash payment after the fact)
-    if (paymentStatus === 'PAID') {
+    // Notify cashier if manually marking PAID (e.g. cash payment recorded after the fact)
+    if (targetStatus === 'PAID') {
       await queueOrderPaymentNotification(prisma, {
         ...order,
         paymentReference: order.orderNumber,

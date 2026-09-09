@@ -859,20 +859,62 @@ router.post('/checkout', requirePosSession, async (req: Request, res: Response, 
 });
 
 // ── GET /api/pos/sales ─────────────────────────────────────────────────────
-router.get('/sales', requireAdmin, requireRole('OWNER'), async (_req: AuthRequest, res: Response, next: NextFunction) => {
+router.get('/sales', requireAdmin, requireRole('OWNER'), async (req: AuthRequest, res: Response, next: NextFunction) => {
   try {
-    const sales = await db.posSale.findMany({ orderBy: { createdAt: 'desc' }, take: 50 });
-    res.json(sales.map((s: any) => ({ ...s, items: JSON.parse(s.items) })));
+    const page  = Math.max(1, parseInt(String(req.query.page  ?? 1), 10));
+    const limit = Math.min(100, Math.max(1, parseInt(String(req.query.limit ?? 50), 10)));
+    const skip  = (page - 1) * limit;
+
+    const [sales, total] = await Promise.all([
+      db.posSale.findMany({ orderBy: { createdAt: 'desc' }, skip, take: limit }),
+      db.posSale.count(),
+    ]);
+
+    res.json({
+      data: sales.map((s: any) => ({ ...s, items: JSON.parse(s.items) })),
+      pagination: { page, limit, total, totalPages: Math.ceil(total / limit) },
+    });
   } catch (error) {
     next(error);
   }
 });
 
 // ── GET /api/pos/audit-logs ────────────────────────────────────────────────
-router.get('/audit-logs', requireAdmin, requireRole('OWNER'), async (_req: AuthRequest, res: Response, next: NextFunction) => {
+router.get('/audit-logs', requireAdmin, requireRole('OWNER'), async (req: AuthRequest, res: Response, next: NextFunction) => {
   try {
-    const logs = await db.auditLog.findMany({ orderBy: { createdAt: 'desc' }, take: 100 });
-    res.json(logs);
+    const page     = Math.max(1, parseInt(String(req.query.page   ?? 1),   10));
+    const limit    = Math.min(200, Math.max(1, parseInt(String(req.query.limit ?? 50), 10)));
+    const skip     = (page - 1) * limit;
+    const category = typeof req.query.category === 'string' ? req.query.category.toUpperCase() : null;
+
+    // Category filter maps friendly names to action prefixes
+    const ACTION_PREFIXES: Record<string, string[]> = {
+      LOGIN:     ['LOGIN', 'LOGOUT', 'POS_LOGIN', 'POS_LOGOUT'],
+      POS:       ['POS_LOGIN', 'POS_LOGOUT', 'SALE_CREATED'],
+      SALES:     ['SALE_CREATED'],
+      PAYMENTS:  ['PAYMENT_'],
+      INVENTORY: ['INVENTORY_'],
+      ORDERS:    ['ORDER_'],
+      SETTINGS:  ['SETTINGS_'],
+      SECURITY:  ['POS_LOGIN', 'PAYMENT_STATUS_OVERRIDDEN', 'ADMIN_'],
+    };
+
+    const where: any = {};
+    if (category && category !== 'ALL' && ACTION_PREFIXES[category]) {
+      where.OR = ACTION_PREFIXES[category].map(prefix => ({
+        action: { startsWith: prefix },
+      }));
+    }
+
+    const [logs, total] = await Promise.all([
+      db.auditLog.findMany({ where, orderBy: { createdAt: 'desc' }, skip, take: limit }),
+      db.auditLog.count({ where }),
+    ]);
+
+    res.json({
+      data: logs,
+      pagination: { page, limit, total, totalPages: Math.ceil(total / limit) },
+    });
   } catch (error) {
     next(error);
   }
