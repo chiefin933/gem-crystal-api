@@ -134,7 +134,7 @@ async function requirePosSession(req: Request, res: Response, next: NextFunction
     (req as AuthRequest).adminId = session.cashierId;
     (req as AuthRequest).adminRole = 'CASHIER';
     (req as AuthRequest).adminEmail = undefined;
-    (req as any).posSession = session;
+    (req as any).posSession = session; // { id, cashierId, cashierName, ... }
     next();
   } catch (error) {
     next(error);
@@ -580,7 +580,7 @@ router.post('/approve-request', requireAdmin, requireRole('OWNER'), async (req: 
 // ── POST /api/pos/checkout ─────────────────────────────────────────────────
 router.post('/checkout', requirePosSession, async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const session = (req as any).posSession as { cashierId: string; cashierName: string };
+    const session = (req as any).posSession as { id: string; cashierId: string; cashierName: string };
     const {
       customerName,
       customerPhone,
@@ -719,7 +719,10 @@ router.post('/checkout', requirePosSession, async (req: Request, res: Response, 
       const createdSale = await tx.posSale.create({
         data: {
           receiptNumber,
+          cashierId: session.cashierId,
           cashierName: session.cashierName,
+          sessionId: session.id,
+          deviceId: 'Tablet POS 01',
           customerName: finalCustomerName,
           mpesaReceipt: finalPaymentMethod === 'MPESA' ? null : (mpesaReceipt || null),
           items: JSON.stringify(lineItems),
@@ -920,7 +923,91 @@ router.get('/audit-logs', requireAdmin, requireRole('OWNER'), async (req: AuthRe
   }
 });
 
-// ── GET /api/pos/sessions ──────────────────────────────────────────────────
+// ── POST /api/pos/sales/:id/complete ──────────────────────────────────────
+// Cashier confirms the customer has paid and the sale is finalised.
+// For CASH this is called immediately at checkout.
+// For M-PESA this is called after the payment popup is acknowledged.
+router.post('/sales/:id/complete', requirePosSession, async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const session = (req as any).posSession as { cashierId: string; cashierName: string; id: string };
+    const sale = await db.posSale.findUnique({ where: { id: req.params.id } });
+
+    if (!sale) throw ApiError.notFound('POS sale not found');
+    if (sale.cashierId && sale.cashierId !== session.cashierId) {
+      throw ApiError.forbidden('You can only complete your own sales');
+    }
+    if (sale.saleStatus === 'COMPLETED') {
+      res.json({ success: true, message: 'Sale already completed', sale });
+      return;
+    }
+    if (sale.paymentStatus !== 'PAID') {
+      throw ApiError.badRequest('Payment must be confirmed before completing the sale');
+    }
+
+    const completed = await db.posSale.update({
+      where: { id: req.params.id },
+      data: { saleStatus: 'COMPLETED', completedAt: new Date() },
+    });
+
+    await db.auditLog.create({
+      data: {
+        actor: session.cashierName,
+        action: 'SALE_COMPLETED',
+        details: `Sale #${sale.receiptNumber} completed by ${session.cashierName}`,
+        ipAddress: req.ip,
+      },
+    });
+
+    res.json({ success: true, sale: { ...completed, items: JSON.parse(completed.items) } });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// ── POST /api/pos/expire-pending ───────────────────────────────────────────
+// Owner/scheduled: expire pending POS sales older than the timeout window
+// and release their stock reservations so inventory doesn't stay locked.
+// Call this from a cron job (e.g. every 5 minutes) or trigger manually.
+router.post('/expire-pending', requireAdmin, requireRole('OWNER'), async (req: AuthRequest, res: Response, next: NextFunction) => {
+  try {
+    const timeoutMinutes = Number(req.body?.timeoutMinutes ?? 30);
+    const cutoff = new Date(Date.now() - timeoutMinutes * 60 * 1000);
+
+    const pending = await db.posSale.findMany({
+      where: {
+        paymentStatus: { in: ['PENDING', 'PENDING_CORRELATION'] },
+        createdAt: { lt: cutoff },
+      },
+    });
+
+    let expired = 0;
+    for (const sale of pending) {
+      await db.$transaction(async (tx: any) => {
+        await tx.posSale.update({
+          where: { id: sale.id },
+          data: { paymentStatus: 'FAILED', saleStatus: 'EXPIRED' },
+        });
+        // Restore stock using the shared helper (defined at top of file)
+        await releaseFailedPosSaleReservation(
+          tx, sale,
+          `Auto-expired after ${timeoutMinutes}min: receipt #${sale.receiptNumber}`,
+        );
+        await tx.auditLog.create({
+          data: {
+            actor: 'System',
+            action: 'PAYMENT_FAILED',
+            details: `POS sale #${sale.receiptNumber} expired after ${timeoutMinutes} minutes — stock restored`,
+          },
+        });
+      });
+      expired++;
+    }
+
+    res.json({ success: true, expired, message: `${expired} pending sale(s) expired and stock released` });
+  } catch (error) {
+    next(error);
+  }
+});
 // Admin: list active POS sessions so the monitoring dashboard shows real data.
 router.get('/sessions', requireAdmin, requireRole('OWNER'), async (_req: AuthRequest, res: Response, next: NextFunction) => {
   try {

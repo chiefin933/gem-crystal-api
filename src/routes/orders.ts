@@ -13,6 +13,14 @@ import {
   isMpesaConfigured,
   normalizeMpesaPhone,
 } from '../services/mpesa';
+import {
+  c2bSecretMatches,
+  C2BPayload,
+  getTillNumber,
+  isC2BConfigured,
+  normalizeC2BPhone,
+  registerC2BUrls,
+} from '../services/mpesaC2B';
 
 const router = Router();
 
@@ -47,12 +55,10 @@ const CheckoutSchema = z.object({
   // but the route handler rejects it before any transaction until a gateway
   // is integrated. This keeps the frontend type valid while blocking fake payments.
   paymentMethod: z.enum(['MPESA', 'CARD']),
+  // mpesaPhone is optional — C2B Till payments don't require the customer's phone.
+  // If provided it is used for order correlation and customer record.
   mpesaPhone: z.string().trim().regex(/^\+?[0-9]{9,15}$/, 'Enter a valid M-PESA phone number').optional(),
-}).strict().superRefine((data, ctx) => {
-  if (data.paymentMethod === 'MPESA' && !data.mpesaPhone) {
-    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['mpesaPhone'], message: 'An M-PESA phone number is required' });
-  }
-});
+}).strict();
 
 const OrderUpdateSchema = z.object({
   // Owners can freely update fulfillment status and attach an M-PESA receipt.
@@ -624,10 +630,21 @@ router.post('/mpesa-callback', async (req: Request, res: Response, next: NextFun
 });
 
 // ── GET /api/orders ───────────────────────────────────────────────────────
-router.get('/', requireAdmin, requireRole('OWNER'), async (_req: AuthRequest, res: Response, next: NextFunction) => {
+router.get('/', requireAdmin, requireRole('OWNER'), async (req: AuthRequest, res: Response, next: NextFunction) => {
   try {
-    const orders = await prisma.order.findMany({ orderBy: { createdAt: 'desc' } });
-    res.json(orders.map(serialiseOrder));
+    const page  = Math.max(1, parseInt(String(req.query.page  ?? 1), 10));
+    const limit = Math.min(100, Math.max(1, parseInt(String(req.query.limit ?? 50), 10)));
+    const skip  = (page - 1) * limit;
+
+    const [orders, total] = await Promise.all([
+      prisma.order.findMany({ orderBy: { createdAt: 'desc' }, skip, take: limit }),
+      prisma.order.count(),
+    ]);
+
+    res.json({
+      data: orders.map(serialiseOrder),
+      pagination: { page, limit, total, totalPages: Math.ceil(total / limit) },
+    });
   } catch (error) {
     next(error);
   }
@@ -754,6 +771,193 @@ router.post('/:id/payment-override', requireAdmin, requireRole('OWNER'), async (
   } catch (error) {
     next(error);
   }
+});
+
+// ── POST /api/orders/mpesa-c2b-register ───────────────────────────────────
+// Owner only — registers our C2B callback URLs with Daraja.
+// Run this once, or whenever the callback URL changes.
+router.post('/mpesa-c2b-register', requireAdmin, requireRole('OWNER'), async (req: AuthRequest, res: Response, next: NextFunction) => {
+  try {
+    if (!isC2BConfigured()) {
+      throw new ApiError(503, 'PAYMENT_FAILED', 'M-PESA C2B is not fully configured. Check MPESA_TILL_NUMBER and other M-PESA env vars.');
+    }
+    const result = await registerC2BUrls();
+    await prisma.auditLog.create({
+      data: {
+        actor: req.adminEmail || req.adminId || 'OWNER',
+        action: 'MPESA_C2B_REGISTERED',
+        details: `C2B URLs registered with Daraja: ${JSON.stringify(result)}`,
+        ipAddress: req.ip,
+      },
+    });
+    res.json({ success: true, result });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// ── POST /api/orders/mpesa-c2b-callback ───────────────────────────────────
+// Daraja sends this when a customer pays the Gem & Crystal Till.
+// We attempt to match the payment to a pending order or POS sale.
+// If no safe match is found, we create an UnmatchedPayment for owner review.
+router.post('/mpesa-c2b-callback', async (req: Request, res: Response, next: NextFunction) => {
+  // Always return 200 to Safaricom immediately — never let them retry on error
+  const accept = () => res.json({ ResultCode: 0, ResultDesc: 'Accepted' });
+  const reject = (reason: string) => {
+    console.warn('[C2B] Rejected callback:', reason);
+    res.json({ ResultCode: 0, ResultDesc: 'Accepted' }); // still 200 to prevent retries
+  };
+
+  try {
+    const token = typeof req.query.token === 'string' ? req.query.token : undefined;
+    if (!c2bSecretMatches(token)) return reject('Invalid callback secret');
+
+    const payload = req.body as C2BPayload;
+    if (!payload?.TransID || !payload?.TransAmount || !payload?.MSISDN) {
+      return reject('Missing required callback fields');
+    }
+
+    const amount   = parseFloat(payload.TransAmount);
+    const receipt  = payload.TransID.trim();
+    const phone    = normalizeC2BPhone(payload.MSISDN);
+    const ref      = (payload.BillRefNumber || '').trim().toUpperCase();
+    const payerName = [payload.FirstName, payload.MiddleName, payload.LastName].filter(Boolean).join(' ') || null;
+
+    if (!Number.isFinite(amount) || amount <= 0) return reject('Invalid amount');
+
+    await prisma.$transaction(async (tx) => {
+      // ── Attempt 1: match by BillRefNumber (receipt/order number) ──────────
+      // Cashier tells customer: "Pay Till XXXXX, reference GC-POS-ABCDE"
+      let matchedOrder: any = null;
+      let matchedSale:  any = null;
+
+      if (ref) {
+        matchedOrder = await tx.order.findFirst({
+          where: { orderNumber: ref, paymentStatus: { in: ['PENDING', 'PENDING_CORRELATION'] } },
+        });
+        if (!matchedOrder) {
+          matchedSale = await (tx as any).posSale.findFirst({
+            where: { receiptNumber: ref, paymentStatus: { in: ['PENDING', 'PENDING_CORRELATION'] } },
+          });
+        }
+      }
+
+      // ── Attempt 2: match by phone + amount where reference missing ────────
+      if (!matchedOrder && !matchedSale) {
+        matchedOrder = await tx.order.findFirst({
+          where: {
+            customerPhone: phone,
+            paymentStatus: { in: ['PENDING', 'PENDING_CORRELATION'] },
+            // amount tolerance ±1 shilling
+            total: { gte: amount - 1, lte: amount + 1 } as any,
+          },
+          orderBy: { createdAt: 'desc' },
+        });
+        if (!matchedOrder) {
+          matchedSale = await (tx as any).posSale.findFirst({
+            where: {
+              customerPhone: phone,
+              paymentStatus: { in: ['PENDING', 'PENDING_CORRELATION'] },
+              total: { gte: amount - 1, lte: amount + 1 } as any,
+            },
+            orderBy: { createdAt: 'desc' },
+          });
+        }
+      }
+
+      // ── No safe match: create UnmatchedPayment for owner review ───────────
+      if (!matchedOrder && !matchedSale) {
+        await (tx as any).unmatchedPayment.upsert({
+          where: { mpesaReceipt: receipt },
+          update: {},
+          create: {
+            mpesaReceipt: receipt,
+            amount,
+            phone,
+            payerName,
+            rawPayload: JSON.stringify(payload),
+            status: 'UNMATCHED',
+          },
+        });
+        await tx.auditLog.create({
+          data: {
+            actor: 'M-PESA C2B service',
+            action: 'PAYMENT_REQUIRES_REVIEW',
+            details: `C2B payment ${receipt} KES ${amount} from ${phone} could not be matched — queued for owner review`,
+            ipAddress: req.ip,
+          },
+        });
+        return;
+      }
+
+      // ── Match found: verify amount and mark paid ──────────────────────────
+      const payment = (matchedOrder || matchedSale)!;
+      const toNum   = (v: any) => (v && typeof v === 'object' ? v.toNumber() : Number(v));
+      const expectedAmount = toNum(payment.total);
+
+      if (Math.abs(amount - expectedAmount) > 1) {
+        // Amount mismatch → unmatched for review
+        await (tx as any).unmatchedPayment.upsert({
+          where: { mpesaReceipt: receipt },
+          update: {},
+          create: {
+            mpesaReceipt: receipt,
+            amount,
+            phone,
+            payerName,
+            rawPayload: JSON.stringify(payload),
+            status: 'UNMATCHED',
+          },
+        });
+        await tx.auditLog.create({
+          data: {
+            actor: 'M-PESA C2B service',
+            action: 'PAYMENT_REQUIRES_REVIEW',
+            details: `C2B amount mismatch for ${matchedOrder ? matchedOrder.orderNumber : matchedSale.receiptNumber}: expected ${expectedAmount}, received ${amount}`,
+            ipAddress: req.ip,
+          },
+        });
+        return;
+      }
+
+      // All checks passed — mark as PAID
+      if (matchedOrder) {
+        const paid = await tx.order.update({
+          where: { id: matchedOrder.id },
+          data: { paymentStatus: 'PAID', mpesaReceipt: receipt },
+        });
+        await queueOrderPaymentNotification(tx, { ...paid, paymentReference: paid.orderNumber });
+      } else {
+        const paid = await (tx as any).posSale.update({
+          where: { id: matchedSale.id },
+          data: { paymentStatus: 'PAID', mpesaReceipt: receipt },
+        });
+        await queuePosSalePaymentNotification(tx, { ...paid, paymentReference: paid.receiptNumber, currency: 'KES' });
+      }
+
+      await tx.auditLog.create({
+        data: {
+          actor: 'M-PESA C2B service',
+          action: 'PAYMENT_CONFIRMED',
+          details: `C2B payment ${receipt} KES ${amount} from ${phone} confirmed for ${matchedOrder ? matchedOrder.orderNumber : matchedSale.receiptNumber}`,
+          ipAddress: req.ip,
+        },
+      });
+    });
+
+    return accept();
+  } catch (error) {
+    console.error('[C2B callback error]', error);
+    return accept(); // always 200 to Safaricom
+  }
+});
+
+// ── GET /api/orders/till-number ───────────────────────────────────────────
+// Public: returns the configured Till number so the storefront and POS
+// can display it to customers without embedding it in frontend code.
+router.get('/till-number', (_req: Request, res: Response) => {
+  const till = getTillNumber();
+  res.json({ tillNumber: till ?? null, configured: !!till });
 });
 
 export default router;

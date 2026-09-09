@@ -81,6 +81,8 @@ model Order {
 
 model PaymentNotification {
   id               String    @id @default(cuid())
+  // Ownership: exactly one of orderId or posSaleId must be non-null.
+  // Enforced at application layer in paymentNotifications.ts.
   orderId          String?   @unique
   customerName     String
   customerPhone    String
@@ -96,6 +98,25 @@ model PaymentNotification {
   posSale          PosSale?  @relation(fields: [posSaleId], references: [id], onDelete: Cascade)
 
   @@index([acknowledgedAt, createdAt])
+}
+
+// Unmatched incoming payments — C2B Till payments that could not be
+// automatically correlated to a pending order or POS sale. Owner must
+// review and manually assign each one.
+model UnmatchedPayment {
+  id             String   @id @default(cuid())
+  mpesaReceipt   String   @unique
+  amount         Decimal  @db.Decimal(10, 2)
+  phone          String
+  payerName      String?
+  rawPayload     String   // full Safaricom callback JSON for audit
+  receivedAt     DateTime @default(now())
+  resolvedAt     DateTime?
+  resolvedBy     String?
+  resolutionNote String?
+  status         String   @default("UNMATCHED") // UNMATCHED | ASSIGNED | IGNORED
+
+  @@index([status, receivedAt])
 }
 
 model Coupon {
@@ -165,7 +186,11 @@ model PosSession {
 model PosSale {
   id                     String               @id @default(cuid())
   receiptNumber          String               @unique
+  // Session linkage — ties every sale to the exact cashier session that created it
+  cashierId              String?
   cashierName            String
+  sessionId              String?
+  deviceId               String?
   customerName           String               @default("Walk-in Customer")
   customerPhone          String?
   mpesaReceipt           String?              @unique
@@ -177,12 +202,19 @@ model PosSale {
   cashReceived           Decimal?             @db.Decimal(10, 2)
   changeGiven            Decimal?             @db.Decimal(10, 2)
   createdAt              DateTime             @default(now())
+  // Payment lifecycle
   mpesaIdempotencyKey    String?              @unique
   mpesaCheckoutRequestId String?              @unique
   mpesaInitiatedAt       DateTime?
   mpesaMerchantRequestId String?              @unique
   paymentStatus          String               @default("PAID")
+  // Sale completion — payment verified ≠ sale completed (cashier must confirm)
+  saleStatus             String               @default("OPEN")   // OPEN | COMPLETED | CANCELLED | EXPIRED
+  completedAt            DateTime?
   paymentNotifications   PaymentNotification?
+
+  @@index([cashierId, createdAt])
+  @@index([saleStatus, createdAt])
 }
 
 model HardwareConfig {

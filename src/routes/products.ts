@@ -208,15 +208,26 @@ router.put('/:id', requireAdmin, requireRole('OWNER'), async (req: AuthRequest, 
 
   try {
     const data = parsed.data;
-    const onSale =
-      data.salePrice !== undefined && data.salePrice !== null
-        ? data.salePrice < (data.price ?? 0)
-        : undefined;
-
-    const priceChanging  = data.price     !== undefined;
+    const priceChanging     = data.price     !== undefined;
     const salePriceChanging = data.salePrice !== undefined;
 
     const product = await prisma.$transaction(async (tx) => {
+      // Load the current product so we can compute onSale correctly when
+      // only one of price/salePrice is supplied in a partial update.
+      const existing = await tx.product.findUnique({
+        where: { id: req.params.id },
+        select: { price: true, salePrice: true },
+      });
+      if (!existing) throw ApiError.notFound('Product not found');
+
+      const resolvedPrice     = priceChanging     ? data.price!     : Number(existing.price);
+      const resolvedSalePrice = salePriceChanging
+        ? data.salePrice       // null means "remove sale price"
+        : (existing.salePrice != null ? Number(existing.salePrice) : null);
+
+      const onSale =
+        resolvedSalePrice != null && resolvedSalePrice > 0 && resolvedSalePrice < resolvedPrice;
+
       const updated = await tx.product.update({
         where: { id: req.params.id },
         data: {
@@ -225,7 +236,7 @@ router.put('/:id', requireAdmin, requireRole('OWNER'), async (req: AuthRequest, 
           ...(data.category     !== undefined && { category: data.category, subcategory: data.category }),
           ...(priceChanging                  && { price: data.price! }),
           ...(salePriceChanging             && { salePrice: data.salePrice }),
-          ...(onSale            !== undefined && { onSale }),
+          onSale,
           ...(data.description  !== undefined && { description: data.description }),
           ...(data.fabricCare   !== undefined && { fabricCare: data.fabricCare }),
           ...(data.images       !== undefined && { images: JSON.stringify(data.images) }),
@@ -239,9 +250,7 @@ router.put('/:id', requireAdmin, requireRole('OWNER'), async (req: AuthRequest, 
         include: { variants: true },
       });
 
-      // Sync variant prices atomically when the product price authority changes.
-      // Checkout always reads variant prices — a stale variant can charge the
-      // old price indefinitely if we don't propagate the change here.
+      // Sync variant prices atomically when the product price authority changes
       if (priceChanging || salePriceChanging) {
         await tx.variant.updateMany({
           where: { productId: req.params.id },
@@ -257,6 +266,7 @@ router.put('/:id', requireAdmin, requireRole('OWNER'), async (req: AuthRequest, 
 
     res.json({ success: true, data: parseProduct(product) });
   } catch (error) {
+    if (error instanceof ApiError) throw error;
     throw ApiError.internal('Failed to update product');
   }
 });
