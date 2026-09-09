@@ -199,7 +199,38 @@ router.post('/payment-notifications/:id/acknowledge', requirePosSession, async (
 });
 
 // ── GET /api/pos/hardware ──────────────────────────────────────────────────
-router.get('/hardware', async (_req: Request, res: Response, next: NextFunction) => {
+// Accessible to active POS sessions (cashier terminal) and authenticated admins
+// (monitoring dashboard). Uses a flexible guard that accepts either token type.
+router.get('/hardware', async (req: Request, res: Response, next: NextFunction) => {
+  // Accept either a valid POS session token or a valid admin JWT
+  const token = getPosToken(req);
+  let authorized = false;
+
+  if (token) {
+    // Try POS session first
+    try {
+      const session = await db.posSession.findFirst({
+        where: { sessionTokenHash: hashSessionToken(token), status: 'ACTIVE', expiresAt: { gt: new Date() } },
+      });
+      if (session) authorized = true;
+    } catch { /* fall through to admin check */ }
+
+    // Try admin JWT if POS session didn't match
+    if (!authorized) {
+      try {
+        const jwt = await import('jsonwebtoken');
+        const JWT_SECRET = process.env.JWT_SECRET!;
+        jwt.default.verify(token, JWT_SECRET, { issuer: 'gem-crystal-api', audience: 'gem-crystal-admin' });
+        authorized = true;
+      } catch { /* not a valid admin token either */ }
+    }
+  }
+
+  if (!authorized) {
+    res.status(401).json({ success: false, error: { code: 'UNAUTHORIZED', message: 'Authentication required' } });
+    return;
+  }
+
   try {
     let hw = await db.hardwareConfig.findUnique({ where: { id: 'pos-01' } });
     if (!hw) {
@@ -216,6 +247,26 @@ router.get('/hardware', async (_req: Request, res: Response, next: NextFunction)
         },
       });
     }
+    res.json({ success: true, hardware: hw });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// ── PATCH /api/pos/hardware ────────────────────────────────────────────────
+// Owner only: update hardware connection status flags.
+router.patch('/hardware', requireAdmin, requireRole('OWNER'), async (req: AuthRequest, res: Response, next: NextFunction) => {
+  try {
+    const allowedFields = ['tabletName', 'tabletConnected', 'barcodeScanner', 'fingerprintReader', 'receiptPrinter', 'cashDrawer', 'status'] as const;
+    const update: Record<string, unknown> = {};
+    for (const field of allowedFields) {
+      if (req.body[field] !== undefined) update[field] = req.body[field];
+    }
+    if (Object.keys(update).length === 0) {
+      res.status(400).json({ success: false, error: { code: 'BAD_REQUEST', message: 'No updatable fields provided' } });
+      return;
+    }
+    const hw = await db.hardwareConfig.update({ where: { id: 'pos-01' }, data: update });
     res.json({ success: true, hardware: hw });
   } catch (error) {
     next(error);
@@ -670,7 +721,6 @@ router.post('/checkout', requirePosSession, async (req: Request, res: Response, 
           receiptNumber,
           cashierName: session.cashierName,
           customerName: finalCustomerName,
-          customerPhone: customerPhone || null,
           mpesaReceipt: finalPaymentMethod === 'MPESA' ? null : (mpesaReceipt || null),
           items: JSON.stringify(lineItems),
           subtotal: serverSubtotal,
@@ -679,7 +729,10 @@ router.post('/checkout', requirePosSession, async (req: Request, res: Response, 
           paymentMethod: finalPaymentMethod,
           paymentStatus: finalPaymentMethod === 'MPESA' ? 'PENDING' : 'PAID',
           cashReceived: finalPaymentMethod === 'CASH' ? Number(cashReceived) : null,
-          changeGiven: finalPaymentMethod === 'CASH' ? Math.max(0, Number(cashReceived) - serverTotal) : null,        },
+          changeGiven: finalPaymentMethod === 'CASH' ? Math.max(0, Number(cashReceived) - serverTotal) : null,
+          // Use the E.164-normalised phone so PosSale.customerPhone always
+          // matches the Customer record and M-PESA callback correlation.
+          customerPhone: normalizedPhone ?? null,        },
       });
 
       if (customerPhone) {

@@ -74,10 +74,21 @@ function normalizedPhone(phone: string): string {
   throw new Error('M-PESA phone number is invalid');
 }
 
+/**
+ * Typed error for Safaricom HTTP responses so the caller can distinguish
+ * 4xx (definitive rejection) from 5xx (ambiguous server error).
+ */
+export class MpesaHttpError extends Error {
+  constructor(public readonly status: number, message: string) {
+    super(message);
+    this.name = 'MpesaHttpError';
+  }
+}
+
 async function fetchJson(url: string, init: RequestInit): Promise<unknown> {
   const response = await fetch(url, { ...init, signal: AbortSignal.timeout(15_000) });
   const body = await response.json().catch(() => null);
-  if (!response.ok) throw new Error(`M-PESA request failed with HTTP ${response.status}`);
+  if (!response.ok) throw new MpesaHttpError(response.status, `M-PESA request failed with HTTP ${response.status}`);
   return body;
 }
 
@@ -155,25 +166,32 @@ export function normalizeMpesaPhone(phone: string): string | null {
 /**
  * Classifies an error thrown by initiateMpesaStkPush.
  *
- * Returns 'TIMEOUT' when the outcome is ambiguous — the request may have
- * reached Safaricom before the connection was lost, so the customer could
- * still receive the STK prompt and pay. The caller must leave the payment
- * PENDING and wait for the Daraja callback or a reconciliation job.
+ * TIMEOUT  — outcome is ambiguous. The request may have reached Safaricom
+ *            before the connection was lost. Leave the payment PENDING and
+ *            wait for the Daraja callback or a reconciliation job.
+ *            Covers: network timeouts, ECONNRESET, ENOTFOUND, HTTP 5xx.
  *
- * Returns 'REJECTED' only when Safaricom or the local config definitively
- * refused the request (wrong credentials, bad phone number, HTTP 4xx/5xx
- * with a clear error body, or ResponseCode !== '0'). In this case it is
- * safe to mark the payment FAILED and restore stock immediately.
+ * REJECTED — Safaricom or local config definitively refused the request.
+ *            Safe to mark FAILED and restore stock immediately.
+ *            Covers: HTTP 4xx, ResponseCode !== '0', bad config/phone.
  */
 export function classifyMpesaInitiationError(error: unknown): 'TIMEOUT' | 'REJECTED' {
-  if (error instanceof Error) {
-    // AbortSignal.timeout() throws a DOMException whose name is 'TimeoutError'
-    if (error.name === 'TimeoutError') return 'TIMEOUT';
-    // Node fetch network failures (ECONNRESET, ENOTFOUND, etc.)
-    if (error.name === 'TypeError' && error.message.includes('fetch')) return 'TIMEOUT';
-    // Any other unknown/unexpected error — treat as ambiguous to be safe
-    if (!error.message.includes('M-PESA')) return 'TIMEOUT';
+  // Network-level timeout from AbortSignal.timeout()
+  if (error instanceof Error && error.name === 'TimeoutError') return 'TIMEOUT';
+
+  // Node fetch network failures (ECONNRESET, ENOTFOUND, ETIMEDOUT, etc.)
+  if (error instanceof TypeError && error.message.toLowerCase().includes('fetch')) return 'TIMEOUT';
+
+  // HTTP errors from Safaricom: 4xx = definitive rejection, 5xx = ambiguous
+  if (error instanceof MpesaHttpError) {
+    return error.status >= 500 ? 'TIMEOUT' : 'REJECTED';
   }
-  // Errors thrown explicitly by our own mpesa.ts code are definitive
-  return 'REJECTED';
+
+  // Explicit application-layer errors from our own mpesa.ts (bad config,
+  // invalid phone, ResponseCode !== '0') — these are definitive rejections
+  if (error instanceof Error && error.message.startsWith('M-PESA')) return 'REJECTED';
+
+  // Anything else unknown — treat as ambiguous to avoid incorrectly
+  // failing a payment that may have been accepted by Safaricom
+  return 'TIMEOUT';
 }

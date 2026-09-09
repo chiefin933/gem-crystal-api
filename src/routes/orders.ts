@@ -55,13 +55,21 @@ const CheckoutSchema = z.object({
 });
 
 const OrderUpdateSchema = z.object({
+  // Owners can freely update fulfillment status and attach an M-PESA receipt.
+  // Payment status changes are handled by the dedicated override endpoint below
+  // to ensure every financial state transition is audited with a reason.
   fulfillmentStatus: z.enum(['PENDING', 'PROCESSING', 'READY', 'SHIPPED', 'DELIVERED']).optional(),
-  paymentStatus: z.enum(['PENDING', 'PAID', 'FAILED']).optional(),
   mpesaReceipt: z.string().trim().min(3).max(100).optional(),
 }).strict().refine(
-  value => value.fulfillmentStatus !== undefined || value.paymentStatus !== undefined || value.mpesaReceipt !== undefined,
+  value => value.fulfillmentStatus !== undefined || value.mpesaReceipt !== undefined,
   { message: 'Provide at least one order update' },
 );
+
+// Separate schema for the payment override endpoint — requires explicit reason
+const PaymentOverrideSchema = z.object({
+  paymentStatus: z.enum(['PAID', 'FAILED', 'PENDING']),
+  reason: z.string().trim().min(3, 'Reason is required for payment status changes').max(500),
+}).strict();
 
 const MpesaCallbackSchema = z.object({
   Body: z.object({
@@ -201,8 +209,6 @@ router.post('/', async (req: Request, res: Response, next: NextFunction) => {
     // Reject before touching the database so no stock is deducted.
 
     if (data.paymentMethod === 'CARD') {
-      // Card gateway is not yet integrated. Rejecting here ensures stock is
-      // never reserved against a payment that cannot be collected.
       throw new ApiError(503, 'PAYMENT_FAILED',
         'Card payments are not yet available. Please pay via M-PESA.',
       );
@@ -212,6 +218,13 @@ router.post('/', async (req: Request, res: Response, next: NextFunction) => {
       throw new ApiError(503, 'PAYMENT_FAILED',
         'M-PESA payments are temporarily unavailable. Please try again later.',
       );
+    }
+
+    // Normalize customer phone to E.164 so all records (Order, Customer,
+    // M-PESA correlation) use a consistent format regardless of input style.
+    const normalizedCustomerPhone = normalizeMpesaPhone(data.customer.phone);
+    if (!normalizedCustomerPhone) {
+      throw ApiError.badRequest('Invalid customer phone number', 'BAD_REQUEST');
     }
 
     const order = await prisma.$transaction(async tx => {
@@ -323,7 +336,7 @@ router.post('/', async (req: Request, res: Response, next: NextFunction) => {
       }
 
       await tx.customer.upsert({
-        where: { phone: data.customer.phone },
+        where: { phone: normalizedCustomerPhone },
         update: {
           name: data.customer.fullName,
           email: data.customer.email || null,
@@ -332,7 +345,7 @@ router.post('/', async (req: Request, res: Response, next: NextFunction) => {
         },
         create: {
           name: data.customer.fullName,
-          phone: data.customer.phone,
+          phone: normalizedCustomerPhone,
           email: data.customer.email || null,
           county: data.customer.county,
           city: data.customer.townCity,
@@ -345,7 +358,7 @@ router.post('/', async (req: Request, res: Response, next: NextFunction) => {
           trackingTokenHash: hashTrackingToken(trackingToken),
           customerName: data.customer.fullName,
           customerEmail: data.customer.email || '',
-          customerPhone: data.customer.phone,
+          customerPhone: normalizedCustomerPhone,
           customerCounty: data.customer.county,
           customerTownCity: data.customer.townCity,
           customerAddress: data.customer.address,
@@ -378,6 +391,9 @@ router.post('/', async (req: Request, res: Response, next: NextFunction) => {
 
     let paymentInitiated = false;
     if (data.paymentMethod === 'MPESA' && data.mpesaPhone && isMpesaConfigured()) {
+      // Normalize the M-PESA phone. Use mpesaPhone if provided (customer may
+      // want a different number), otherwise fall back to normalizedCustomerPhone.
+      const mpesaPayPhone = normalizeMpesaPhone(data.mpesaPhone) ?? normalizedCustomerPhone;
       // Generate a unique idempotency key and persist it BEFORE calling
       // Safaricom. If the HTTP connection drops after Daraja accepts the
       // request but before we receive the response, the key lets us
@@ -395,7 +411,7 @@ router.post('/', async (req: Request, res: Response, next: NextFunction) => {
         const paymentRequest = await initiateMpesaStkPush({
           orderNumber: order.orderNumber,
           amount: toNum(order.total),
-          phone: data.mpesaPhone,
+          phone: mpesaPayPhone,
         });
         const saved = await prisma.order.updateMany({
           where: { id: order.id, paymentStatus: 'PENDING', mpesaCheckoutRequestId: null },
@@ -507,6 +523,12 @@ router.post('/mpesa-callback', async (req: Request, res: Response, next: NextFun
     }
 
     const callback = parsed.data.Body.stkCallback;
+
+    // Capture event payloads outside the transaction so they can be emitted
+    // after commit. Never schedule events inside $transaction — a rollback
+    // would already have fired them.
+    let pendingEvent: (() => void) | null = null;
+
     const outcome = await prisma.$transaction(async tx => {
       const order = await tx.order.findUnique({ where: { mpesaCheckoutRequestId: callback.CheckoutRequestID } });
       const sale = order ? null : await tx.posSale.findUnique({ where: { mpesaCheckoutRequestId: callback.CheckoutRequestID } });
@@ -528,11 +550,11 @@ router.post('/mpesa-callback', async (req: Request, res: Response, next: NextFun
           await tx.auditLog.create({
             data: { actor: 'M-PESA payment service', action: 'PAYMENT_FAILED', details: `Payment #${reference}: ${callback.ResultDesc}`, ipAddress: req.ip },
           });
-          setImmediate(() => eventBus.emit('PaymentFailed', {
-            reference: reference!,
-            type: order ? 'ORDER' : 'POS_SALE',
-            reason: callback.ResultDesc,
-          }));
+          // Capture event data — emit after transaction commits below
+          const evtRef = reference!;
+          const evtType = order ? 'ORDER' : 'POS_SALE';
+          const evtReason = callback.ResultDesc;
+          pendingEvent = () => eventBus.emit('PaymentFailed', { reference: evtRef, type: evtType as any, reason: evtReason });
         }
         return { accepted: true, message: 'Payment result received' };
       }
@@ -564,39 +586,36 @@ router.post('/mpesa-callback', async (req: Request, res: Response, next: NextFun
       if (order) {
         const paid = await tx.order.update({ where: { id: order.id }, data: { paymentStatus: 'PAID', mpesaReceipt: receipt.trim() } });
         await queueOrderPaymentNotification(tx, { ...paid, paymentReference: paid.orderNumber });
-        // Emit after the transaction — listener wrapped in try/catch so it can never roll back the payment
-        setImmediate(() => eventBus.emit('OrderPaid', {
-          orderId: paid.id,
-          orderNumber: paid.orderNumber,
-          customerName: paid.customerName,
-          customerPhone: paid.customerPhone,
-          customerAddress: paid.customerAddress,
-          customerTownCity: paid.customerTownCity,
-          customerCounty: paid.customerCounty,
-          total: toNum(paid.total),
-          paymentMethod: paid.paymentMethod,
-          mpesaReceipt: paid.mpesaReceipt,
+        // Capture event payload — emit AFTER transaction commits
+        const evt = {
+          orderId: paid.id, orderNumber: paid.orderNumber,
+          customerName: paid.customerName, customerPhone: paid.customerPhone,
+          customerAddress: paid.customerAddress, customerTownCity: paid.customerTownCity,
+          customerCounty: paid.customerCounty, total: toNum(paid.total),
+          paymentMethod: paid.paymentMethod, mpesaReceipt: paid.mpesaReceipt,
           items: JSON.parse(paid.items),
-        }));
+        };
+        pendingEvent = () => eventBus.emit('OrderPaid', evt);
       } else {
         const paid = await tx.posSale.update({ where: { id: sale!.id }, data: { paymentStatus: 'PAID', mpesaReceipt: receipt.trim() } });
         await queuePosSalePaymentNotification(tx, { ...paid, paymentReference: paid.receiptNumber, currency: 'KES' });
-        setImmediate(() => eventBus.emit('SaleCreated', {
-          receiptNumber: paid.receiptNumber,
-          cashierName: paid.cashierName,
-          customerName: paid.customerName,
-          customerPhone: paid.customerPhone,
-          total: toNum(paid.total),
-          paymentMethod: paid.paymentMethod,
-          mpesaReceipt: paid.mpesaReceipt,
-          items: JSON.parse(paid.items),
-        }));
+        const evt = {
+          receiptNumber: paid.receiptNumber, cashierName: paid.cashierName,
+          customerName: paid.customerName, customerPhone: paid.customerPhone,
+          total: toNum(paid.total), paymentMethod: paid.paymentMethod,
+          mpesaReceipt: paid.mpesaReceipt, items: JSON.parse(paid.items),
+        };
+        pendingEvent = () => eventBus.emit('SaleCreated', evt);
       }
       await tx.auditLog.create({
         data: { actor: 'M-PESA payment service', action: 'PAYMENT_CONFIRMED', details: `Payment #${reference} confirmed via M-PESA receipt ${receipt.trim()}`, ipAddress: req.ip },
       });
       return { accepted: true, message: 'Payment confirmed' };
     });
+
+    // Emit domain events AFTER the transaction has committed.
+    // Using setImmediate here is safe because we are outside $transaction.
+    if (pendingEvent) setImmediate(pendingEvent);
 
     res.json({ ResultCode: outcome.accepted ? 0 : 1, ResultDesc: outcome.message });
   } catch (error) {
@@ -615,6 +634,8 @@ router.get('/', requireAdmin, requireRole('OWNER'), async (_req: AuthRequest, re
 });
 
 // ── PUT /api/orders/:id ───────────────────────────────────────────────────
+// Admin: update fulfillment status and/or attach an M-PESA receipt.
+// Payment status changes must go through POST /api/orders/:id/payment-override.
 router.put('/:id', requireAdmin, requireRole('OWNER'), async (req: AuthRequest, res: Response, next: NextFunction) => {
   try {
     const parsed = OrderUpdateSchema.safeParse(req.body);
@@ -625,24 +646,84 @@ router.put('/:id', requireAdmin, requireRole('OWNER'), async (req: AuthRequest, 
     const existing = await prisma.order.findUnique({ where: { id: req.params.id } });
     if (!existing) throw ApiError.notFound('Order not found');
 
-    const order = await prisma.order.update({ where: { id: req.params.id }, data: parsed.data });
-    if (existing.paymentStatus !== 'PAID' && order.paymentStatus === 'PAID') {
+    const order = await prisma.order.update({
+      where: { id: req.params.id },
+      data: parsed.data,
+    });
+
+    await prisma.auditLog.create({
+      data: {
+        actor: req.adminEmail || req.adminId || 'OWNER',
+        action: 'ORDER_STATUS_UPDATED',
+        details: `Updated order #${order.orderNumber}: ${JSON.stringify(parsed.data)}`,
+        ipAddress: req.ip,
+      },
+    });
+
+    res.json(serialiseOrder(order));
+  } catch (error) {
+    next(error);
+  }
+});
+
+// ── POST /api/orders/:id/payment-override ─────────────────────────────────
+// Admin: manually override an order's payment status.
+// Every override requires an explicit reason and creates an AuditLog.
+// FAILED override restores stock; PAID override queues the cashier notification.
+router.post('/:id/payment-override', requireAdmin, requireRole('OWNER'), async (req: AuthRequest, res: Response, next: NextFunction) => {
+  try {
+    const parsed = PaymentOverrideSchema.safeParse(req.body);
+    if (!parsed.success) {
+      throw ApiError.badRequest('Validation failed', 'BAD_REQUEST', parsed.error.flatten());
+    }
+
+    const { paymentStatus, reason } = parsed.data;
+    const actor = req.adminEmail || req.adminId || 'OWNER';
+
+    const order = await prisma.$transaction(async (tx) => {
+      const existing = await tx.order.findUnique({ where: { id: req.params.id } });
+      if (!existing) throw ApiError.notFound('Order not found');
+
+      if (existing.paymentStatus === paymentStatus) {
+        throw ApiError.badRequest(`Order is already in ${paymentStatus} state`);
+      }
+
+      const updated = await tx.order.update({
+        where: { id: req.params.id },
+        data: { paymentStatus },
+      });
+
+      // Restore stock when manually marking an order FAILED
+      if (paymentStatus === 'FAILED' && existing.paymentStatus !== 'FAILED') {
+        await releaseFailedOrderReservation(tx, existing, `Manual payment override: ${reason}`);
+      }
+
+      await tx.auditLog.create({
+        data: {
+          actor,
+          action: 'PAYMENT_STATUS_OVERRIDDEN',
+          details: JSON.stringify({
+            orderNumber: existing.orderNumber,
+            from: existing.paymentStatus,
+            to: paymentStatus,
+            reason,
+          }),
+          ipAddress: req.ip,
+        },
+      });
+
+      return updated;
+    });
+
+    // Notify cashier if manually marking PAID (e.g. cash payment after the fact)
+    if (paymentStatus === 'PAID') {
       await queueOrderPaymentNotification(prisma, {
         ...order,
         paymentReference: order.orderNumber,
       });
     }
 
-    await prisma.auditLog.create({
-      data: {
-        actor: req.adminEmail || req.adminId || 'OWNER',
-        action: 'ORDER_STATUS_UPDATED',
-        details: `Updated order #${order.orderNumber}`,
-        ipAddress: req.ip,
-      },
-    });
-
-    res.json(serialiseOrder(order));
+    res.json({ success: true, data: serialiseOrder(order) });
   } catch (error) {
     next(error);
   }

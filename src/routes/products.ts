@@ -193,7 +193,9 @@ const UpdateProductSchema = z.object({
 );
 
 // ── PUT /api/admin/products/:id ───────────────────────────────────────────
-// Admin: update a product
+// Admin: update a product. When price/salePrice changes, all of this
+// product's variants are updated in the same transaction so the storefront
+// never serves stale pricing.
 router.put('/:id', requireAdmin, requireRole('OWNER'), async (req: AuthRequest, res: Response) => {
   const parsed = UpdateProductSchema.safeParse(req.body);
   if (!parsed.success) {
@@ -211,26 +213,46 @@ router.put('/:id', requireAdmin, requireRole('OWNER'), async (req: AuthRequest, 
         ? data.salePrice < (data.price ?? 0)
         : undefined;
 
-    const product = await prisma.product.update({
-      where: { id: req.params.id },
-      data: {
-        ...(data.title       !== undefined && { title: data.title }),
-        ...(data.gender      !== undefined && { gender: data.gender }),
-        ...(data.category    !== undefined && { category: data.category, subcategory: data.category }),
-        ...(data.price       !== undefined && { price: data.price }),
-        ...(data.salePrice   !== undefined && { salePrice: data.salePrice }),
-        ...(onSale           !== undefined && { onSale }),
-        ...(data.description !== undefined && { description: data.description }),
-        ...(data.fabricCare  !== undefined && { fabricCare: data.fabricCare }),
-        ...(data.images      !== undefined && { images: JSON.stringify(data.images) }),
-        ...(data.sizes       !== undefined && { sizes: JSON.stringify(data.sizes) }),
-        ...(data.colors      !== undefined && { colors: JSON.stringify(data.colors) }),
-        ...(data.isNew       !== undefined && { isNew: data.isNew }),
-        ...(data.isBestSeller !== undefined && { isBestSeller: data.isBestSeller }),
-        ...(data.isFeatured  !== undefined && { isFeatured: data.isFeatured }),
-        ...(data.isActive    !== undefined && { isActive: data.isActive }),
-      },
-      include: { variants: true },
+    const priceChanging  = data.price     !== undefined;
+    const salePriceChanging = data.salePrice !== undefined;
+
+    const product = await prisma.$transaction(async (tx) => {
+      const updated = await tx.product.update({
+        where: { id: req.params.id },
+        data: {
+          ...(data.title        !== undefined && { title: data.title }),
+          ...(data.gender       !== undefined && { gender: data.gender }),
+          ...(data.category     !== undefined && { category: data.category, subcategory: data.category }),
+          ...(priceChanging                  && { price: data.price! }),
+          ...(salePriceChanging             && { salePrice: data.salePrice }),
+          ...(onSale            !== undefined && { onSale }),
+          ...(data.description  !== undefined && { description: data.description }),
+          ...(data.fabricCare   !== undefined && { fabricCare: data.fabricCare }),
+          ...(data.images       !== undefined && { images: JSON.stringify(data.images) }),
+          ...(data.sizes        !== undefined && { sizes: JSON.stringify(data.sizes) }),
+          ...(data.colors       !== undefined && { colors: JSON.stringify(data.colors) }),
+          ...(data.isNew        !== undefined && { isNew: data.isNew }),
+          ...(data.isBestSeller !== undefined && { isBestSeller: data.isBestSeller }),
+          ...(data.isFeatured   !== undefined && { isFeatured: data.isFeatured }),
+          ...(data.isActive     !== undefined && { isActive: data.isActive }),
+        },
+        include: { variants: true },
+      });
+
+      // Sync variant prices atomically when the product price authority changes.
+      // Checkout always reads variant prices — a stale variant can charge the
+      // old price indefinitely if we don't propagate the change here.
+      if (priceChanging || salePriceChanging) {
+        await tx.variant.updateMany({
+          where: { productId: req.params.id },
+          data: {
+            ...(priceChanging     && { price: data.price! }),
+            ...(salePriceChanging && { salePrice: data.salePrice }),
+          },
+        });
+      }
+
+      return updated;
     });
 
     res.json({ success: true, data: parseProduct(product) });
