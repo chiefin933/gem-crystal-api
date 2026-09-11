@@ -24,6 +24,8 @@ router.get('/', async (_req: Request, res: Response) => {
         phone: '+254 718 796 296',
         whatsappNumber: '254718796296',
         deliveryFeeDisclaimer: 'Delivery fee is paid separately by the customer and is not included in the product order total unless otherwise stated by the shop.',
+        deliveryFeeKes: 350,
+        freeDeliveryThresholdKes: 10000,
         aiChatEnabled: true,
       });
       return;

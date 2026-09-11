@@ -76,6 +76,8 @@ model Order {
   mpesaCheckoutRequestId String?              @unique
   mpesaInitiatedAt       DateTime?
   mpesaMerchantRequestId String?              @unique
+  // Payment expiry — if not paid by this time, stock reservation is released
+  paymentExpiresAt       DateTime?
   paymentNotifications   PaymentNotification?
 }
 
@@ -142,15 +144,18 @@ model Admin {
 }
 
 model StoreSettings {
-  id                    String   @id @default("default")
-  storeName             String   @default("Gem & Crystal Fashion Hub")
-  tagline               String   @default("BE BOLD. BE BRIGHT. BE YOU.")
-  location              String   @default("Roysambu, Nairobi, Kenya")
-  phone                 String   @default("+254 718 796 296")
-  whatsappNumber        String   @default("254718796296")
-  deliveryFeeDisclaimer String   @default("Delivery fee is paid separately by the customer and is not included in the product order total unless otherwise stated by the shop.")
-  aiChatEnabled         Boolean  @default(true)
-  updatedAt             DateTime @updatedAt
+  id                       String   @id @default("default")
+  storeName                String   @default("Gem & Crystal Fashion Hub")
+  tagline                  String   @default("BE BOLD. BE BRIGHT. BE YOU.")
+  location                 String   @default("Roysambu, Nairobi, Kenya")
+  phone                    String   @default("+254 718 796 296")
+  whatsappNumber           String   @default("254718796296")
+  deliveryFeeDisclaimer    String   @default("Delivery fee is paid separately by the customer and is not included in the product order total unless otherwise stated by the shop.")
+  // Delivery pricing — single source of truth used by checkout, AI, and frontend
+  deliveryFeeKes           Int      @default(350)
+  freeDeliveryThresholdKes Int      @default(10000)
+  aiChatEnabled            Boolean  @default(true)
+  updatedAt                DateTime @updatedAt
 }
 
 model PosLoginRequest {
@@ -208,12 +213,15 @@ model PosSale {
   mpesaInitiatedAt       DateTime?
   mpesaMerchantRequestId String?              @unique
   paymentStatus          String               @default("PAID")
+  // Payment expiry — if not paid by this time, stock reservation is released
+  paymentExpiresAt       DateTime?
   // Sale completion — payment verified ≠ sale completed (cashier must confirm)
   saleStatus             String               @default("OPEN")   // OPEN | COMPLETED | CANCELLED | EXPIRED
   completedAt            DateTime?
   paymentNotifications   PaymentNotification?
 
   @@index([cashierId, createdAt])
+  @@index([sessionId, paymentStatus])
   @@index([saleStatus, createdAt])
 }
 

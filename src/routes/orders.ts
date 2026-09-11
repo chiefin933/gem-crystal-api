@@ -6,6 +6,7 @@ import { ApiError } from '../lib/ApiError';
 import { requireAdmin, requireRole, AuthRequest } from '../middleware/auth';
 import { queueOrderPaymentNotification, queuePosSalePaymentNotification } from '../services/paymentNotifications';
 import { eventBus } from '../events/EventBus';
+import { releaseFailedOrderReservation } from './orderHelpers';
 import {
   callbackSecretMatches,
   classifyMpesaInitiationError,
@@ -128,40 +129,7 @@ function callbackValue(items: Array<{ Name: string; Value?: string | number | nu
   return items.find(item => item.Name === name)?.Value ?? null;
 }
 
-async function releaseFailedOrderReservation(tx: any, order: any, reason: string): Promise<void> {
-  const items = JSON.parse(order.items) as Array<{ variantId: string; quantity: number; title: string }>;
-  for (const item of items) {
-    if (!item.variantId || !Number.isInteger(item.quantity) || item.quantity < 1) continue;
-    const variant = await tx.variant.findUnique({ where: { id: item.variantId } });
-    if (!variant) continue;
-    const restored = await tx.variant.update({
-      where: { id: item.variantId },
-      data: { stockQuantity: { increment: item.quantity } },
-      select: { stockQuantity: true },
-    });
-    await tx.inventoryMovement.create({
-      data: {
-        variantId: item.variantId,
-        type: 'RETURN',
-        quantity: item.quantity,
-        previousStock: restored.stockQuantity - item.quantity,
-        newStock: restored.stockQuantity,
-        reason,
-        referenceType: 'ECOM_ORDER',
-        referenceId: order.orderNumber,
-        actor: 'M-PESA payment service',
-      },
-    });
-  }
-
-  if (order.couponCode) {
-    await tx.coupon.updateMany({
-      where: { code: order.couponCode, usageCount: { gt: 0 } },
-      data: { usageCount: { decrement: 1 } },
-    });
-  }
-}
-
+// releaseFailedPosSaleReservation is kept local since it's only used in the M-PESA callback here
 async function releaseFailedPosSaleReservation(tx: any, sale: any, reason: string): Promise<void> {
   const items = JSON.parse(sale.items) as Array<{ variantId: string; quantity: number }>;
   for (const item of items) {
@@ -273,6 +241,12 @@ router.post('/', async (req: Request, res: Response, next: NextFunction) => {
       let couponCode: string | null = null;
       let discount = 0;
 
+      // Load delivery config from StoreSettings — single source of truth
+      // shared with the AI tool (ai.ts) and the storefront UI.
+      const storeSettings = await tx.storeSettings.findUnique({ where: { id: 'default' } });
+      const DELIVERY_FEE_KES          = storeSettings?.deliveryFeeKes          ?? 350;
+      const FREE_DELIVERY_THRESHOLD   = storeSettings?.freeDeliveryThresholdKes ?? 10000;
+
       if (data.couponCode) {
         const coupon = await tx.coupon.findUnique({ where: { code: data.couponCode } });
         const expired = !coupon || new Date(coupon.expiryDate) < new Date();
@@ -291,7 +265,7 @@ router.post('/', async (req: Request, res: Response, next: NextFunction) => {
         ));
       }
 
-      const deliveryFee = subtotal >= 10000 ? 0 : 350;
+      const deliveryFee = subtotal >= FREE_DELIVERY_THRESHOLD ? 0 : DELIVERY_FEE_KES;
       const total = roundMoney(subtotal - discount + deliveryFee);
 
       // The conditional update is the stock authority. It prevents two
@@ -311,11 +285,11 @@ router.post('/', async (req: Request, res: Response, next: NextFunction) => {
         await tx.inventoryMovement.create({
           data: {
             variantId: item.variantId,
-            type: 'SALE',
+            type: 'RESERVATION',
             quantity: -item.quantity,
             previousStock: rows[0].stockQuantity + item.quantity,
             newStock: rows[0].stockQuantity,
-            reason: `E-commerce order #${orderNumber}`,
+            reason: `E-commerce order reserved #${orderNumber}`,
             referenceType: 'ECOM_ORDER',
             referenceId: orderNumber,
             actor: 'Storefront customer',
@@ -381,6 +355,10 @@ router.post('/', async (req: Request, res: Response, next: NextFunction) => {
           fulfillmentStatus: 'PENDING',
           mpesaPhone: data.paymentMethod === 'MPESA' ? data.mpesaPhone || null : null,
           mpesaReceipt: null,
+          // M-PESA payments expire in 30 minutes if not confirmed
+          paymentExpiresAt: data.paymentMethod === 'MPESA'
+            ? new Date(Date.now() + 30 * 60 * 1000)
+            : null,
         },
       });
     });
@@ -768,6 +746,108 @@ router.post('/:id/payment-override', requireAdmin, requireRole('OWNER'), async (
     }
 
     res.json({ success: true, data: serialiseOrder(order) });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// ── GET /api/orders/unmatched-payments ────────────────────────────────────
+// Owner: list unmatched C2B Till payments requiring manual review.
+router.get('/unmatched-payments', requireAdmin, requireRole('OWNER'), async (req: AuthRequest, res: Response, next: NextFunction) => {
+  try {
+    const page  = Math.max(1, parseInt(String(req.query.page  ?? 1), 10));
+    const limit = Math.min(100, Math.max(1, parseInt(String(req.query.limit ?? 50), 10)));
+    const skip  = (page - 1) * limit;
+
+    const [payments, total] = await Promise.all([
+      (prisma as any).unmatchedPayment.findMany({
+        where: { status: 'UNMATCHED' },
+        orderBy: { receivedAt: 'desc' },
+        skip,
+        take: limit,
+      }),
+      (prisma as any).unmatchedPayment.count({ where: { status: 'UNMATCHED' } }),
+    ]);
+
+    res.json({
+      data: payments,
+      pagination: { page, limit, total, totalPages: Math.ceil(total / limit) },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// ── POST /api/orders/unmatched-payments/:id/resolve ───────────────────────
+// Owner: mark an unmatched payment as IGNORED or manually ASSIGN to order/sale.
+router.post('/unmatched-payments/:id/resolve', requireAdmin, requireRole('OWNER'), async (req: AuthRequest, res: Response, next: NextFunction) => {
+  try {
+    const { action, note, targetType, targetRef } = req.body as {
+      action: 'ASSIGNED' | 'IGNORED';
+      note: string;
+      targetType?: 'ORDER' | 'POS_SALE';
+      targetRef?: string;
+    };
+
+    if (!['ASSIGNED', 'IGNORED'].includes(action)) {
+      throw ApiError.badRequest('action must be ASSIGNED or IGNORED');
+    }
+    if (!note?.trim()) {
+      throw ApiError.badRequest('A resolution note is required');
+    }
+
+    const payment = await (prisma as any).unmatchedPayment.findUnique({ where: { id: req.params.id } });
+    if (!payment) throw ApiError.notFound('Unmatched payment not found');
+    if (payment.status !== 'UNMATCHED') {
+      throw ApiError.badRequest(`Payment is already ${payment.status}`);
+    }
+
+    const actor = req.adminEmail || req.adminId || 'OWNER';
+
+    await prisma.$transaction(async (tx) => {
+      // If ASSIGNED, mark the target order/sale as PAID
+      if (action === 'ASSIGNED' && targetType && targetRef) {
+        if (targetType === 'ORDER') {
+          await tx.order.updateMany({
+            where: { orderNumber: targetRef, paymentStatus: { in: ['PENDING', 'PENDING_CORRELATION'] } },
+            data: { paymentStatus: 'PAID', mpesaReceipt: payment.mpesaReceipt },
+          });
+        } else {
+          await (tx as any).posSale.updateMany({
+            where: { receiptNumber: targetRef, paymentStatus: { in: ['PENDING', 'PENDING_CORRELATION'] } },
+            data: { paymentStatus: 'PAID', mpesaReceipt: payment.mpesaReceipt },
+          });
+        }
+      }
+
+      await (tx as any).unmatchedPayment.update({
+        where: { id: req.params.id },
+        data: {
+          status: action,
+          resolvedAt: new Date(),
+          resolvedBy: actor,
+          resolutionNote: note.trim(),
+        },
+      });
+
+      await tx.auditLog.create({
+        data: {
+          actor,
+          action: 'UNMATCHED_PAYMENT_RESOLVED',
+          details: JSON.stringify({
+            mpesaReceipt: payment.mpesaReceipt,
+            amount: payment.amount,
+            resolution: action,
+            note: note.trim(),
+            targetType,
+            targetRef,
+          }),
+          ipAddress: req.ip,
+        },
+      });
+    });
+
+    res.json({ success: true });
   } catch (error) {
     next(error);
   }

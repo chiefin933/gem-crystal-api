@@ -139,10 +139,11 @@ router.get('/stats', requireAdmin, requireRole('OWNER'), async (_req: AuthReques
         take: 20,
       }),
       prisma.coupon.count({ where: { isActive: true } }),
-      // POS paid sales
-      (prisma as any).posSale.findMany({ where: { paymentStatus: 'PAID' }, select: { total: true } }),
-      (prisma as any).posSale.aggregate({ where: { paymentMethod: 'MPESA', paymentStatus: 'PAID' }, _sum: { total: true } }),
-      (prisma as any).posSale.aggregate({ where: { paymentMethod: 'CASH', paymentStatus: 'PAID' }, _sum: { total: true } }),
+      // POS paid sales — use saleStatus=COMPLETED so revenue reflects
+      // only fully finalized sales, not just payment confirmations
+      (prisma as any).posSale.findMany({ where: { saleStatus: 'COMPLETED' }, select: { total: true } }),
+      (prisma as any).posSale.aggregate({ where: { paymentMethod: 'MPESA', saleStatus: 'COMPLETED' }, _sum: { total: true } }),
+      (prisma as any).posSale.aggregate({ where: { paymentMethod: 'CASH', saleStatus: 'COMPLETED' }, _sum: { total: true } }),
       // Ecommerce by method
       prisma.order.aggregate({ where: { paymentMethod: 'MPESA', paymentStatus: 'PAID' }, _sum: { total: true } }),
       prisma.order.aggregate({ where: { paymentMethod: 'CARD', paymentStatus: 'PAID' }, _sum: { total: true } }),

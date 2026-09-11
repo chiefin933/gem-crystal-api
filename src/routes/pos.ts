@@ -6,8 +6,9 @@ import { z } from 'zod';
 import { prisma } from '../lib/prisma';
 import { ApiError } from '../lib/ApiError';
 import { AuthRequest, requireAdmin, requireRole } from '../middleware/auth';
-import { initiateMpesaStkPush, isMpesaConfigured, normalizeMpesaPhone, classifyMpesaInitiationError } from '../services/mpesa';
+import { isMpesaConfigured, normalizeMpesaPhone } from '../services/mpesa';
 import { eventBus } from '../events/EventBus';
+import { releaseFailedOrderReservation } from './orderHelpers';
 
 /**
  * toNum — converts a Prisma Decimal (or plain number) to a JS number.
@@ -143,16 +144,26 @@ async function requirePosSession(req: Request, res: Response, next: NextFunction
 
 // ── GET /api/pos/payment-notifications ────────────────────────────────────
 // Returns unacknowledged payment notifications to the POS terminal.
+// Scoped to the active session — only notifications for sales created by
+// THIS session are returned, preventing cross-terminal notification leakage.
 // Notifications are NOT marked acknowledged here — the POS must confirm
 // successful receipt by calling POST /payment-notifications/:id/acknowledge.
-// This prevents notifications from being silently lost if Wi-Fi drops
-// between the backend responding and the POS displaying the alert.
-router.get('/payment-notifications', requirePosSession, async (_req: Request, res: Response, next: NextFunction) => {
+router.get('/payment-notifications', requirePosSession, async (req: Request, res: Response, next: NextFunction) => {
   try {
+    const session = (req as any).posSession as { id: string; cashierId: string };
+
+    // Only surface notifications for POS sales that belong to this session.
+    // We join through posSaleId → PosSale.sessionId for session-scoped delivery.
+    // Order notifications (ecommerce) are not shown on the POS terminal.
     const notifications = await db.paymentNotification.findMany({
-      where: { acknowledgedAt: null },
+      where: {
+        acknowledgedAt: null,
+        posSaleId: { not: null },
+        posSale: { sessionId: session.id },
+      },
       orderBy: { createdAt: 'asc' },
       take: 20,
+      include: { posSale: { select: { sessionId: true } } },
     });
 
     res.json({
@@ -581,6 +592,12 @@ router.post('/approve-request', requireAdmin, requireRole('OWNER'), async (req: 
 router.post('/checkout', requirePosSession, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const session = (req as any).posSession as { id: string; cashierId: string; cashierName: string };
+
+    // F9: Enforce session linkage — every sale must be traceable to a cashier and session.
+    // These fields come from requirePosSession middleware; throw if somehow missing.
+    if (!session.id || !session.cashierId || !session.cashierName) {
+      throw ApiError.unauthorized('Invalid POS session — cannot create sale without session context');
+    }
     const {
       customerName,
       customerPhone,
@@ -731,6 +748,10 @@ router.post('/checkout', requirePosSession, async (req: Request, res: Response, 
           total: serverTotal,
           paymentMethod: finalPaymentMethod,
           paymentStatus: finalPaymentMethod === 'MPESA' ? 'PENDING' : 'PAID',
+          // M-PESA sales expire after 30 minutes if not paid — stock released by expire-pending
+          paymentExpiresAt: finalPaymentMethod === 'MPESA'
+            ? new Date(Date.now() + 30 * 60 * 1000)
+            : null,
           cashReceived: finalPaymentMethod === 'CASH' ? Number(cashReceived) : null,
           changeGiven: finalPaymentMethod === 'CASH' ? Math.max(0, Number(cashReceived) - serverTotal) : null,
           // Use the E.164-normalised phone so PosSale.customerPhone always
@@ -775,82 +796,41 @@ router.post('/checkout', requirePosSession, async (req: Request, res: Response, 
       }));
     }
 
-    let paymentInitiated = false;
-    if (finalPaymentMethod === 'MPESA' && normalizedPhone) {
-      // Write idempotency key BEFORE calling Safaricom so any callback that
-      // arrives after a network timeout can still be correlated to this sale.
+    // ── C2B Till payment architecture ─────────────────────────────────────
+    // The POS no longer initiates an STK Push. Instead:
+    //   1. Sale is created as PENDING with a unique idempotency key
+    //   2. Cashier shows the customer: Till number + amount + receipt ref
+    //   3. Customer independently pays via Lipa na M-PESA → Buy Goods
+    //   4. Safaricom sends C2B callback to /api/orders/mpesa-c2b-callback
+    //   5. Backend verifies and matches payment to this sale
+    //   6. PaymentNotification appears on POS (3s poll)
+    //   7. Cashier acknowledges, then calls POST /sales/:id/complete
+    if (finalPaymentMethod === 'MPESA') {
+      // Write idempotency key so the C2B callback can correlate by receipt number
       const idempotencyKey = crypto.randomBytes(16).toString('hex');
       await db.posSale.update({
         where: { id: sale.id },
         data: { mpesaIdempotencyKey: idempotencyKey, mpesaInitiatedAt: new Date() },
       });
 
-      try {
-        const paymentRequest = await initiateMpesaStkPush({
-          orderNumber: sale.receiptNumber,
-          amount: toNum(sale.total),
-          phone: normalizedPhone,
-        });
-        paymentInitiated = (await db.posSale.updateMany({
-          where: { id: sale.id, paymentStatus: 'PENDING', mpesaCheckoutRequestId: null },
-          data: {
-            mpesaCheckoutRequestId: paymentRequest.checkoutRequestId,
-            mpesaMerchantRequestId: paymentRequest.merchantRequestId,
-          },
-        })).count === 1;
-      } catch (error) {
-        // Classify the error before deciding what to do with stock.
-        const errorClass = classifyMpesaInitiationError(error);
-        console.error(`M-PESA STK initiation ${errorClass === 'TIMEOUT' ? 'timed out' : 'failed'} for ${sale.receiptNumber}:`, error instanceof Error ? error.message : error);
-
-        if (errorClass === 'REJECTED') {
-          // Safaricom definitively refused the request — safe to fail immediately.
-          await db.$transaction(async (tx: any) => {
-            await tx.posSale.updateMany({
-              where: { id: sale.id, paymentStatus: 'PENDING' },
-              data: { paymentStatus: 'FAILED' },
-            });
-            await releaseFailedPosSaleReservation(tx, sale, `M-PESA STK rejected for receipt #${sale.receiptNumber}`);
-            await tx.auditLog.create({
-              data: {
-                actor: session.cashierName,
-                action: 'PAYMENT_FAILED',
-                details: `M-PESA STK rejected for receipt #${sale.receiptNumber}. Stock restored. Error: ${error instanceof Error ? error.message : 'unknown'}`,
-              },
-            });
-          });
-          throw ApiError.badRequest(
-            'M-PESA payment was rejected. Stock has been released. Please retry or accept cash.',
-            'PAYMENT_FAILED',
-          );
-        }
-
-        // TIMEOUT: outcome is ambiguous — Safaricom may have accepted the STK
-        // before the connection dropped. Mark PENDING_CORRELATION so the owner
-        // and reconciliation job can distinguish it from a normal pending payment.
-        // The idempotency key written above ensures any arriving callback can
-        // still be matched even without the CheckoutRequestID.
-        await db.posSale.updateMany({
-          where: { id: sale.id, paymentStatus: 'PENDING' },
-          data: { paymentStatus: 'PENDING_CORRELATION' },
-        });
-        await db.auditLog.create({
-          data: {
-            actor: session.cashierName,
-            action: 'PAYMENT_PENDING',
-            details: `M-PESA STK timed out for receipt #${sale.receiptNumber}. Marked PENDING_CORRELATION — awaiting callback or reconciliation.`,
-          },
-        });
-        // Return success=true with paymentInitiated=false — the POS should
-        // show the cashier a "waiting for M-PESA confirmation" state.
-      }
+      await db.auditLog.create({
+        data: {
+          actor: session.cashierName,
+          action: 'PAYMENT_PENDING',
+          details: `POS sale #${sale.receiptNumber} awaiting customer Till payment — KES ${toNum(sale.total)}. Idempotency key recorded.`,
+        },
+      });
     }
+
+    const tillNumber = process.env.MPESA_TILL_NUMBER || null;
 
     res.status(201).json({
       success: true,
       receiptNumber,
       sale: { ...sale, items: JSON.parse(sale.items) },
-      paymentInitiated,
+      // C2B: no server-initiated payment prompt — customer pays independently
+      paymentInitiated: false,
+      tillNumber,
       signals: {
         cashDrawerKickout: finalPaymentMethod === 'CASH',
         receiptPrinterTrigger: finalPaymentMethod !== 'MPESA',
@@ -925,85 +905,166 @@ router.get('/audit-logs', requireAdmin, requireRole('OWNER'), async (req: AuthRe
 
 // ── POST /api/pos/sales/:id/complete ──────────────────────────────────────
 // Cashier confirms the customer has paid and the sale is finalised.
-// For CASH this is called immediately at checkout.
-// For M-PESA this is called after the payment popup is acknowledged.
+// For CASH: called immediately after checkout.
+// For M-PESA: called after the cashier acknowledges the payment popup.
+//
+// Guards enforced:
+//   • Active POS session required
+//   • Cashier can only complete their own sales (sessionId match)
+//   • Sale must exist and belong to this session
+//   • Payment must be PAID
+//   • Amount in the sale must be positive
+//   • Duplicate completion is safe (idempotent)
+//   • Update is atomic — uses updateMany with status guard to prevent
+//     double-completion under concurrent requests
 router.post('/sales/:id/complete', requirePosSession, async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const session = (req as any).posSession as { cashierId: string; cashierName: string; id: string };
-    const sale = await db.posSale.findUnique({ where: { id: req.params.id } });
+    const session = (req as any).posSession as { id: string; cashierId: string; cashierName: string };
 
+    const sale = await db.posSale.findUnique({ where: { id: req.params.id } });
     if (!sale) throw ApiError.notFound('POS sale not found');
+
+    // Session-scoped ownership: the sale must belong to this cashier's session
+    if (sale.sessionId && sale.sessionId !== session.id) {
+      throw ApiError.forbidden('This sale belongs to a different POS session');
+    }
     if (sale.cashierId && sale.cashierId !== session.cashierId) {
       throw ApiError.forbidden('You can only complete your own sales');
     }
+
+    // Idempotent — already completed is not an error
     if (sale.saleStatus === 'COMPLETED') {
-      res.json({ success: true, message: 'Sale already completed', sale });
+      res.json({ success: true, message: 'Sale already completed', sale: { ...sale, items: JSON.parse(sale.items) } });
       return;
     }
-    if (sale.paymentStatus !== 'PAID') {
-      throw ApiError.badRequest('Payment must be confirmed before completing the sale');
+
+    if (sale.saleStatus === 'CANCELLED' || sale.saleStatus === 'EXPIRED') {
+      throw ApiError.badRequest(`Cannot complete a ${sale.saleStatus} sale`);
     }
 
-    const completed = await db.posSale.update({
-      where: { id: req.params.id },
-      data: { saleStatus: 'COMPLETED', completedAt: new Date() },
+    if (sale.paymentStatus !== 'PAID') {
+      throw ApiError.badRequest(
+        `Payment must be confirmed before completing the sale (current: ${sale.paymentStatus})`,
+      );
+    }
+
+    const toNum = (v: any) => (v && typeof v === 'object' ? v.toNumber() : Number(v));
+    if (toNum(sale.total) <= 0) {
+      throw ApiError.badRequest('Sale total must be greater than zero');
+    }
+
+    // Atomic update — the WHERE clause prevents double-completion under
+    // simultaneous requests from two browser tabs
+    const result = await db.$transaction(async (tx: any) => {
+      const updated = await tx.posSale.updateMany({
+        where: { id: sale.id, saleStatus: 'OPEN' },
+        data: { saleStatus: 'COMPLETED', completedAt: new Date() },
+      });
+
+      if (updated.count !== 1) {
+        // Either already completed by a concurrent request, or state changed
+        return null;
+      }
+
+      await tx.auditLog.create({
+        data: {
+          actor: session.cashierName,
+          action: 'SALE_COMPLETED',
+          details: `Sale #${sale.receiptNumber} completed by ${session.cashierName} | total KES ${toNum(sale.total)} | ${sale.paymentMethod}`,
+          ipAddress: req.ip,
+        },
+      });
+
+      return tx.posSale.findUnique({ where: { id: sale.id } });
     });
 
-    await db.auditLog.create({
-      data: {
-        actor: session.cashierName,
-        action: 'SALE_COMPLETED',
-        details: `Sale #${sale.receiptNumber} completed by ${session.cashierName}`,
-        ipAddress: req.ip,
-      },
-    });
-
-    res.json({ success: true, sale: { ...completed, items: JSON.parse(completed.items) } });
+    const finalSale = result ?? await db.posSale.findUnique({ where: { id: sale.id } });
+    res.json({ success: true, sale: { ...finalSale, items: JSON.parse(finalSale.items) } });
   } catch (error) {
     next(error);
   }
 });
 
 // ── POST /api/pos/expire-pending ───────────────────────────────────────────
-// Owner/scheduled: expire pending POS sales older than the timeout window
-// and release their stock reservations so inventory doesn't stay locked.
+// Owner/scheduled: expire pending POS sales AND ecommerce orders whose
+// payment window has passed, releasing their stock reservations.
 // Call this from a cron job (e.g. every 5 minutes) or trigger manually.
+// Uses paymentExpiresAt when set; falls back to timeoutMinutes from createdAt.
 router.post('/expire-pending', requireAdmin, requireRole('OWNER'), async (req: AuthRequest, res: Response, next: NextFunction) => {
   try {
     const timeoutMinutes = Number(req.body?.timeoutMinutes ?? 30);
-    const cutoff = new Date(Date.now() - timeoutMinutes * 60 * 1000);
+    const now = new Date();
+    const fallbackCutoff = new Date(now.getTime() - timeoutMinutes * 60 * 1000);
 
-    const pending = await db.posSale.findMany({
-      where: {
-        paymentStatus: { in: ['PENDING', 'PENDING_CORRELATION'] },
-        createdAt: { lt: cutoff },
-      },
+    // Expired condition: paymentExpiresAt has passed OR createdAt older than fallback
+    const expiredCondition = {
+      OR: [
+        { paymentExpiresAt: { lte: now } },
+        { paymentExpiresAt: null, createdAt: { lt: fallbackCutoff } },
+      ],
+    };
+
+    // ── Expire POS sales ──────────────────────────────────────────────────
+    const pendingSales = await db.posSale.findMany({
+      where: { paymentStatus: { in: ['PENDING', 'PENDING_CORRELATION'] }, ...expiredCondition },
     });
 
-    let expired = 0;
-    for (const sale of pending) {
+    let expiredSales = 0;
+    for (const sale of pendingSales) {
       await db.$transaction(async (tx: any) => {
         await tx.posSale.update({
           where: { id: sale.id },
           data: { paymentStatus: 'FAILED', saleStatus: 'EXPIRED' },
         });
-        // Restore stock using the shared helper (defined at top of file)
         await releaseFailedPosSaleReservation(
           tx, sale,
-          `Auto-expired after ${timeoutMinutes}min: receipt #${sale.receiptNumber}`,
+          `Auto-expired: receipt #${sale.receiptNumber}`,
         );
         await tx.auditLog.create({
           data: {
             actor: 'System',
             action: 'PAYMENT_FAILED',
-            details: `POS sale #${sale.receiptNumber} expired after ${timeoutMinutes} minutes — stock restored`,
+            details: `POS sale #${sale.receiptNumber} payment expired — stock restored`,
           },
         });
       });
-      expired++;
+      expiredSales++;
     }
 
-    res.json({ success: true, expired, message: `${expired} pending sale(s) expired and stock released` });
+    // ── Expire ecommerce orders ───────────────────────────────────────────
+    const pendingOrders = await prisma.order.findMany({
+      where: {
+        paymentStatus: { in: ['PENDING', 'PENDING_CORRELATION'] },
+        ...expiredCondition,
+      } as any,
+    });
+
+    let expiredOrders = 0;
+    for (const order of pendingOrders) {
+      await prisma.$transaction(async (tx) => {
+        await tx.order.update({
+          where: { id: order.id },
+          data: { paymentStatus: 'FAILED' },
+        });
+        await releaseFailedOrderReservation(tx, order, `Auto-expired: order #${order.orderNumber}`);
+        await tx.auditLog.create({
+          data: {
+            actor: 'System',
+            action: 'PAYMENT_FAILED',
+            details: `Order #${order.orderNumber} payment expired — stock restored`,
+            ipAddress: null,
+          },
+        });
+      });
+      expiredOrders++;
+    }
+
+    res.json({
+      success: true,
+      expiredSales,
+      expiredOrders,
+      message: `${expiredSales} POS sale(s) and ${expiredOrders} order(s) expired — stock released`,
+    });
   } catch (error) {
     next(error);
   }

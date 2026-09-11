@@ -260,17 +260,14 @@ async function executeTool(name: string, args: Record<string, any>): Promise<str
 
     case 'get_delivery_info': {
       const settings = await prisma.storeSettings.findUnique({ where: { id: 'default' } });
-      // Delivery fee and free-delivery threshold must match the checkout logic
-      // in orders.ts (deliveryFee = subtotal >= 10000 ? 0 : 350).
-      // These constants are the single source of truth — the AI reads them
-      // from here rather than being hard-coded in the system prompt.
-      const DELIVERY_FEE = 350;
-      const FREE_DELIVERY_THRESHOLD = 10000;
+      // Read from StoreSettings — the single source of truth shared with orders.ts
+      const DELIVERY_FEE        = settings?.deliveryFeeKes          ?? 350;
+      const FREE_THRESHOLD      = settings?.freeDeliveryThresholdKes ?? 10000;
       return JSON.stringify({
         coverage: 'Kenya nationwide',
         deliveryFee: DELIVERY_FEE,
-        freeDeliveryThreshold: FREE_DELIVERY_THRESHOLD,
-        freeDeliveryNote: `Orders of KES ${FREE_DELIVERY_THRESHOLD.toLocaleString()} and above qualify for free delivery`,
+        freeDeliveryThreshold: FREE_THRESHOLD,
+        freeDeliveryNote: `Orders of KES ${FREE_THRESHOLD.toLocaleString()} and above qualify for free delivery`,
         currency: 'KES',
         disclaimer: settings?.deliveryFeeDisclaimer ?? 'Delivery fee is paid separately by the customer.',
         note: 'Delivery times vary by location. Contact the shop for estimates.',
