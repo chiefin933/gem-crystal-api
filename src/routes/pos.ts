@@ -11,10 +11,64 @@ import { eventBus } from '../events/EventBus';
 import { releaseFailedOrderReservation } from './orderHelpers';
 
 /**
- * toNum — converts a Prisma Decimal (or plain number) to a JS number.
- * Required because schema.prisma Decimal fields return Decimal objects at
- * runtime; all JS arithmetic and comparisons need plain numbers.
+ * completeSaleAtomically — deducts stock and marks a POS sale COMPLETED.
+ * Called immediately for CASH sales and from POST /sales/:id/complete for MPESA.
+ * Uses atomic SQL RETURNING so InventoryMovement records DB-verified values.
  */
+async function completeSaleAtomically(db: any, sale: any, session: { cashierName: string }, ipAddress: string): Promise<any> {
+  const toNum = (v: any) => (v && typeof v === 'object' ? v.toNumber() : Number(v));
+
+  const result = await db.$transaction(async (tx: any) => {
+    // Guard: only complete if still OPEN
+    const updated = await tx.posSale.updateMany({
+      where: { id: sale.id, saleStatus: 'OPEN' },
+      data: { saleStatus: 'COMPLETED', completedAt: new Date() },
+    });
+    if (updated.count !== 1) return tx.posSale.findUnique({ where: { id: sale.id } });
+
+    const lineItems = JSON.parse(sale.items) as Array<{
+      variantId: string; title: string; size: string; color: string; quantity: number;
+    }>;
+    for (const item of lineItems) {
+      const rows = await tx.$queryRaw<Array<{ stockQuantity: number }>>`
+        UPDATE "Variant" SET "stockQuantity" = "stockQuantity" - ${item.quantity}
+        WHERE "id" = ${item.variantId} AND "stockQuantity" >= ${item.quantity}
+        RETURNING "stockQuantity"
+      `;
+      if (rows.length !== 1) {
+        throw ApiError.outOfStock(`"${item.title}" (${item.size}/${item.color}) went out of stock`);
+      }
+      await tx.inventoryMovement.create({
+        data: {
+          variantId: item.variantId, type: 'SALE', quantity: -item.quantity,
+          previousStock: rows[0].stockQuantity + item.quantity, newStock: rows[0].stockQuantity,
+          reason: `POS sale completed #${sale.receiptNumber}`, referenceType: 'POS_SALE',
+          referenceId: sale.receiptNumber, actor: session.cashierName,
+        },
+      });
+    }
+
+    if (sale.paymentMethod === 'MPESA' && sale.mpesaReceipt) {
+      const existing = await tx.salePayment.findFirst({ where: { posSaleId: sale.id, method: 'MPESA' } });
+      if (!existing) {
+        await tx.salePayment.create({
+          data: { posSaleId: sale.id, method: 'MPESA', amount: toNum(sale.total), mpesaReceipt: sale.mpesaReceipt, status: 'CONFIRMED' },
+        });
+      }
+    }
+
+    await tx.auditLog.create({
+      data: {
+        actor: session.cashierName, action: 'SALE_COMPLETED',
+        details: `Sale #${sale.receiptNumber} completed | KES ${toNum(sale.total)} | ${sale.paymentMethod} | stock deducted`,
+        ipAddress,
+      },
+    });
+    return tx.posSale.findUnique({ where: { id: sale.id } });
+  });
+  return result;
+}
+
 function toNum(v: { toNumber(): number } | number | null | undefined): number {
   if (v == null) return 0;
   return typeof v === 'object' ? v.toNumber() : Number(v);
@@ -693,44 +747,17 @@ router.post('/checkout', requirePosSession, async (req: Request, res: Response, 
     }
 
     const sale = await db.$transaction(async (tx: any) => {
+      // Stock availability check — warn cashier now but do NOT deduct yet.
+      // Stock is deducted atomically inside POST /sales/:id/complete after
+      // payment is confirmed. This satisfies the payment-first invariant.
       for (const item of lineItems) {
         const variant = variantsById.get(item.variantId);
         if (!variant) throw ApiError.notFound(`Product variant ${item.variantId} was not found`);
-
-        // Atomic stock deduction with RETURNING so the InventoryMovement
-        // records the exact transition verified by the database, not a stale
-        // client-side value that could have changed between the findMany and
-        // this update.
-        const rows = await tx.$queryRaw<Array<{ stockQuantity: number }>>`
-          UPDATE "Variant"
-          SET "stockQuantity" = "stockQuantity" - ${item.quantity}
-          WHERE "id" = ${item.variantId}
-            AND "stockQuantity" >= ${item.quantity}
-          RETURNING "stockQuantity"
-        `;
-
-        if (rows.length !== 1) {
+        if (variant.stockQuantity < item.quantity) {
           throw ApiError.outOfStock(
-            `Item "${item.title}" (${item.size}/${item.color}) is out of stock or has insufficient stock`
+            `Item "${item.title}" (${item.size}/${item.color}) — only ${variant.stockQuantity} left`
           );
         }
-
-        const newStock = rows[0].stockQuantity;
-        const previousStock = newStock + item.quantity;
-
-        await tx.inventoryMovement.create({
-          data: {
-            variantId: item.variantId,
-            type: 'SALE',
-            quantity: -item.quantity,
-            previousStock,
-            newStock,
-            reason: `POS Sale Receipt #${receiptNumber}`,
-            referenceType: 'POS_SALE',
-            referenceId: receiptNumber,
-            actor: session.cashierName,
-          },
-        });
       }
 
       const createdSale = await tx.posSale.create({
@@ -747,21 +774,32 @@ router.post('/checkout', requirePosSession, async (req: Request, res: Response, 
           discount: serverDiscount,
           total: serverTotal,
           paymentMethod: finalPaymentMethod,
+          // CASH is immediately PAID; M-PESA waits for C2B callback confirmation
           paymentStatus: finalPaymentMethod === 'MPESA' ? 'PENDING' : 'PAID',
-          // M-PESA sales expire after 30 minutes if not paid — stock released by expire-pending
           paymentExpiresAt: finalPaymentMethod === 'MPESA'
             ? new Date(Date.now() + 30 * 60 * 1000)
             : null,
           cashReceived: finalPaymentMethod === 'CASH' ? Number(cashReceived) : null,
           changeGiven: finalPaymentMethod === 'CASH' ? Math.max(0, Number(cashReceived) - serverTotal) : null,
-          // Use the E.164-normalised phone so PosSale.customerPhone always
-          // matches the Customer record and M-PESA callback correlation.
-          customerPhone: normalizedPhone ?? null,        },
+          customerPhone: normalizedPhone ?? null,
+          // saleStatus starts OPEN — completed by cashier after payment confirmed
+          saleStatus: 'OPEN',
+        },
       });
 
+      // Record cash payment in the SalePayment ledger immediately
+      if (finalPaymentMethod === 'CASH') {
+        await tx.salePayment.create({
+          data: {
+            posSaleId: createdSale.id,
+            method: 'CASH',
+            amount: serverTotal,
+            status: 'CONFIRMED',
+          },
+        });
+      }
+
       if (customerPhone) {
-        // Use the normalized phone so +254712345678, 0712345678, and
-        // 254712345678 all resolve to the same customer record.
         const persistPhone = normalizedPhone || customerPhone;
         await tx.customer.upsert({
           where: { phone: persistPhone },
@@ -780,6 +818,12 @@ router.post('/checkout', requirePosSession, async (req: Request, res: Response, 
 
       return createdSale;
     });
+
+    // For CASH: complete the sale immediately since payment is in hand.
+    // This deducts stock atomically and finalises the sale in one step.
+    if (finalPaymentMethod === 'CASH') {
+      await completeSaleAtomically(db, sale, session, req.ip ?? '');
+    }
 
     // For CASH sales, emit SaleCreated immediately after the transaction.
     // MPESA sales emit SaleCreated from the M-PESA callback (after payment confirmation).
@@ -948,37 +992,12 @@ router.post('/sales/:id/complete', requirePosSession, async (req: Request, res: 
       );
     }
 
-    const toNum = (v: any) => (v && typeof v === 'object' ? v.toNumber() : Number(v));
     if (toNum(sale.total) <= 0) {
       throw ApiError.badRequest('Sale total must be greater than zero');
     }
 
-    // Atomic update — the WHERE clause prevents double-completion under
-    // simultaneous requests from two browser tabs
-    const result = await db.$transaction(async (tx: any) => {
-      const updated = await tx.posSale.updateMany({
-        where: { id: sale.id, saleStatus: 'OPEN' },
-        data: { saleStatus: 'COMPLETED', completedAt: new Date() },
-      });
-
-      if (updated.count !== 1) {
-        // Either already completed by a concurrent request, or state changed
-        return null;
-      }
-
-      await tx.auditLog.create({
-        data: {
-          actor: session.cashierName,
-          action: 'SALE_COMPLETED',
-          details: `Sale #${sale.receiptNumber} completed by ${session.cashierName} | total KES ${toNum(sale.total)} | ${sale.paymentMethod}`,
-          ipAddress: req.ip,
-        },
-      });
-
-      return tx.posSale.findUnique({ where: { id: sale.id } });
-    });
-
-    const finalSale = result ?? await db.posSale.findUnique({ where: { id: sale.id } });
+    // Use shared helper — deducts stock atomically and marks COMPLETED
+    const finalSale = await completeSaleAtomically(db, sale, session, req.ip ?? '');
     res.json({ success: true, sale: { ...finalSale, items: JSON.parse(finalSale.items) } });
   } catch (error) {
     next(error);

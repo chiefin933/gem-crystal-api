@@ -165,37 +165,80 @@ router.get('/stats', requireAdmin, requireRole('OWNER'), async (_req: AuthReques
     const posMpesa: number  = toNum(posMpesaAgg._sum.total);
     const posCash:  number  = toNum(posCashAgg._sum.total);
 
+    // ── Sales by day — last 14 days ───────────────────────────────────────
+    const fourteenDaysAgo = new Date(Date.now() - 14 * 24 * 60 * 60 * 1000);
+
+    const [recentOrders, recentPosSales] = await Promise.all([
+      prisma.order.findMany({
+        where: { paymentStatus: 'PAID', createdAt: { gte: fourteenDaysAgo } },
+        select: { createdAt: true, total: true },
+      }),
+      (prisma as any).posSale.findMany({
+        where: { saleStatus: 'COMPLETED', createdAt: { gte: fourteenDaysAgo } },
+        select: { createdAt: true, total: true },
+      }),
+    ]);
+
+    // Build date→revenue map for the last 14 days
+    const dayMap = new Map<string, number>();
+    for (let i = 13; i >= 0; i--) {
+      const d = new Date(Date.now() - i * 24 * 60 * 60 * 1000);
+      dayMap.set(d.toISOString().slice(0, 10), 0);
+    }
+    for (const o of recentOrders) {
+      const key = new Date(o.createdAt).toISOString().slice(0, 10);
+      if (dayMap.has(key)) dayMap.set(key, (dayMap.get(key) ?? 0) + toNum(o.total));
+    }
+    for (const s of recentPosSales) {
+      const key = new Date(s.createdAt).toISOString().slice(0, 10);
+      if (dayMap.has(key)) dayMap.set(key, (dayMap.get(key) ?? 0) + toNum(s.total));
+    }
+    const salesByDay = [...dayMap.entries()].map(([date, revenue]) => ({ date, revenue: Math.round(revenue) }));
+
+    // ── Top products by units sold (last 30 days) ─────────────────────────
+    const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+
+    const [ordersForRanking, posForRanking] = await Promise.all([
+      prisma.order.findMany({
+        where: { paymentStatus: 'PAID', createdAt: { gte: thirtyDaysAgo } },
+        select: { items: true },
+      }),
+      (prisma as any).posSale.findMany({
+        where: { saleStatus: 'COMPLETED', createdAt: { gte: thirtyDaysAgo } },
+        select: { items: true },
+      }),
+    ]);
+
+    const productSales = new Map<string, { title: string; units: number; revenue: number }>();
+    const allSalesItems = [...ordersForRanking, ...posForRanking];
+    for (const record of allSalesItems) {
+      try {
+        const items = JSON.parse(record.items) as Array<{ title: string; quantity: number; price: number }>;
+        for (const item of items) {
+          const existing = productSales.get(item.title) ?? { title: item.title, units: 0, revenue: 0 };
+          existing.units   += item.quantity;
+          existing.revenue += item.price * item.quantity;
+          productSales.set(item.title, existing);
+        }
+      } catch { /* skip malformed */ }
+    }
+
+    const sortedProducts = [...productSales.values()].sort((a, b) => b.units - a.units);
+    const topProducts  = sortedProducts.slice(0, 5).map(p => ({ ...p, revenue: Math.round(p.revenue) }));
+    const slowProducts = sortedProducts.slice(-5).reverse().map(p => ({ ...p, revenue: Math.round(p.revenue) }));
+
     res.json({
-      // Product / order counts
-      totalProducts,
-      totalOrders,
-      pendingOrders,
-      avgOrderValue,
-      activeCoupons: coupons,
-
-      // Revenue — full business picture
-      totalRevenue,          // ecommerce + POS combined
-      ecomRevenue,           // online storefront only
-      posRevenue,            // in-store POS only
-
-      // Payment method breakdown across all channels
-      mpesaRevenue: ecomMpesa + posMpesa,   // total M-PESA across both channels
-      cashRevenue:  posCash,                // cash (POS only)
-      cardRevenue:  ecomCard,               // card (ecommerce; currently 0)
-
-      // Per-channel breakdown for the dashboard cards
-      ecomMpesaRevenue: ecomMpesa,
-      posMpesaRevenue:  posMpesa,
-      posCashRevenue:   posCash,
-
+      totalProducts, totalOrders, pendingOrders, avgOrderValue, activeCoupons: coupons,
+      totalRevenue, ecomRevenue, posRevenue,
+      mpesaRevenue: ecomMpesa + posMpesa, cashRevenue: posCash, cardRevenue: ecomCard,
+      ecomMpesaRevenue: ecomMpesa, posMpesaRevenue: posMpesa, posCashRevenue: posCash,
+      // Analytics
+      salesByDay,
+      topProducts,
+      slowProducts,
       lowStockVariants: lowStockVariants.map(v => ({
-        variantId: v.id,
-        sku: v.sku,
-        size: v.size,
-        color: v.color,
-        stockQuantity: v.stockQuantity,
-        productTitle: v.product.title,
-        productCategory: v.product.category,
+        variantId: v.id, sku: v.sku, size: v.size, color: v.color,
+        stockQuantity: v.stockQuantity, productTitle: v.product.title, productCategory: v.product.category,
       })),
     });
   } catch (error) {

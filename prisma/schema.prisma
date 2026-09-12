@@ -121,6 +121,54 @@ model UnmatchedPayment {
   @@index([status, receivedAt])
 }
 
+// ── Website Checkout Session ───────────────────────────────────────────────
+// Created BEFORE any order. Holds customer intent and cart while waiting
+// for Safaricom C2B payment. Order and stock deduction happen only inside
+// the C2B callback transaction — never before payment confirmation.
+model CheckoutSession {
+  id              String    @id @default(cuid())
+  sessionRef      String    @unique  // customer-facing reference e.g. GC-PAY-XXXXX
+  customerName    String
+  customerEmail   String    @default("")
+  customerPhone   String
+  customerCounty  String
+  customerTownCity String
+  customerAddress  String
+  customerNotes   String    @default("")
+  itemsJson       String    // JSON snapshot of cart items + prices at session creation
+  subtotal        Decimal   @db.Decimal(10, 2)
+  discount        Decimal   @default(0) @db.Decimal(10, 2)
+  couponCode      String?
+  deliveryFee     Decimal   @db.Decimal(10, 2)
+  total           Decimal   @db.Decimal(10, 2)
+  currency        String    @default("KES")
+  paymentMethod   String    @default("MPESA")
+  status          String    @default("AWAITING_PAYMENT") // AWAITING_PAYMENT | PAID | EXPIRED | FAILED
+  createdAt       DateTime  @default(now())
+  expiresAt       DateTime
+  mpesaReceipt    String?   @unique
+  orderId         String?   @unique  // set after Order is created on payment confirmation
+
+  @@index([status, expiresAt])
+  @@index([sessionRef])
+}
+
+// ── POS Sale Payment Ledger ───────────────────────────────────────────────
+// Records each individual payment component for a POS sale.
+// Supports mixed payments (e.g. M-PESA + Cash) and partial payments.
+model SalePayment {
+  id            String   @id @default(cuid())
+  posSaleId     String
+  posSale       PosSale  @relation(fields: [posSaleId], references: [id], onDelete: Cascade)
+  method        String   // MPESA | CASH
+  amount        Decimal  @db.Decimal(10, 2)
+  mpesaReceipt  String?  @unique
+  status        String   @default("CONFIRMED") // CONFIRMED | PENDING | FAILED
+  confirmedAt   DateTime @default(now())
+
+  @@index([posSaleId])
+}
+
 model Coupon {
   code           String   @id
   discountType   String
@@ -216,8 +264,10 @@ model PosSale {
   // Payment expiry — if not paid by this time, stock reservation is released
   paymentExpiresAt       DateTime?
   // Sale completion — payment verified ≠ sale completed (cashier must confirm)
+  // Stock is deducted atomically INSIDE the complete-sale transaction, NOT at checkout.
   saleStatus             String               @default("OPEN")   // OPEN | COMPLETED | CANCELLED | EXPIRED
   completedAt            DateTime?
+  payments               SalePayment[]        // individual payment components (M-PESA, cash)
   paymentNotifications   PaymentNotification?
 
   @@index([cashierId, createdAt])

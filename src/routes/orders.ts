@@ -158,8 +158,11 @@ async function releaseFailedPosSaleReservation(tx: any, sale: any, reason: strin
 }
 
 // ── POST /api/orders ──────────────────────────────────────────────────────
-// Public: create an unpaid order. Prices, stock, discounts, and totals are
-// always recalculated from database values; browser-supplied money is ignored.
+// Public: create a CheckoutSession — NO order, NO stock deduction yet.
+// Prices and availability are validated but stock is only deducted after
+// Safaricom confirms payment inside the C2B callback transaction.
+// This satisfies the payment-first invariant: if Safaricom has not confirmed,
+// no order exists and no stock is touched.
 router.post('/', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const parsed = CheckoutSchema.safeParse(req.body);
@@ -172,286 +175,150 @@ router.post('/', async (req: Request, res: Response, next: NextFunction) => {
     for (const item of data.items) {
       quantities.set(item.variantId, (quantities.get(item.variantId) || 0) + item.quantity);
     }
-    if ([...quantities.values()].some(quantity => quantity > 20)) {
+    if ([...quantities.values()].some(q => q > 20)) {
       throw ApiError.badRequest('A maximum of 20 units is allowed per product variant');
     }
 
-    const orderNumber = newOrderNumber();
-    const trackingToken = crypto.randomBytes(32).toString('base64url');
-
-    // ── Pre-transaction gates ─────────────────────────────────────────────
-    // Reject before touching the database so no stock is deducted.
-
     if (data.paymentMethod === 'CARD') {
-      throw new ApiError(503, 'PAYMENT_FAILED',
-        'Card payments are not yet available. Please pay via M-PESA.',
-      );
+      throw new ApiError(503, 'PAYMENT_FAILED', 'Card payments are not yet available. Please pay via M-PESA.');
     }
 
-    if (data.paymentMethod === 'MPESA' && !isMpesaConfigured()) {
-      throw new ApiError(503, 'PAYMENT_FAILED',
-        'M-PESA payments are temporarily unavailable. Please try again later.',
-      );
-    }
-
-    // Normalize customer phone to E.164 so all records (Order, Customer,
-    // M-PESA correlation) use a consistent format regardless of input style.
     const normalizedCustomerPhone = normalizeMpesaPhone(data.customer.phone);
     if (!normalizedCustomerPhone) {
       throw ApiError.badRequest('Invalid customer phone number', 'BAD_REQUEST');
     }
 
-    const order = await prisma.$transaction(async tx => {
-      const variants = await tx.variant.findMany({
-        where: {
-          id: { in: [...quantities.keys()] },
-          product: { isActive: true },
-        },
-        include: {
-          product: {
-            select: { id: true, title: true, images: true, isActive: true },
-          },
-        },
-      });
-
-      if (variants.length !== quantities.size) {
-        throw ApiError.badRequest('One or more selected products are no longer available');
-      }
-
-      const variantsById = new Map(variants.map(variant => [variant.id, variant]));
-      const lineItems = [...quantities.entries()].map(([variantId, quantity]) => {
-        const variant = variantsById.get(variantId);
-        if (!variant || !variant.product.isActive) {
-          throw ApiError.badRequest('One or more selected products are no longer available');
-        }
-        const price = toNum(variant.salePrice ?? variant.price);
-        return {
-          productId: variant.productId,
-          variantId: variant.id,
-          title: variant.product.title,
-          size: variant.size,
-          color: variant.color,
-          price,
-          quantity,
-          image: JSON.parse(variant.product.images || '[]')[0] || '',
-        };
-      });
-
-      const subtotal = roundMoney(lineItems.reduce((sum, item) => sum + item.price * item.quantity, 0));
-      let couponCode: string | null = null;
-      let discount = 0;
-
-      // Load delivery config from StoreSettings — single source of truth
-      // shared with the AI tool (ai.ts) and the storefront UI.
-      const storeSettings = await tx.storeSettings.findUnique({ where: { id: 'default' } });
-      const DELIVERY_FEE_KES          = storeSettings?.deliveryFeeKes          ?? 350;
-      const FREE_DELIVERY_THRESHOLD   = storeSettings?.freeDeliveryThresholdKes ?? 10000;
-
-      if (data.couponCode) {
-        const coupon = await tx.coupon.findUnique({ where: { code: data.couponCode } });
-        const expired = !coupon || new Date(coupon.expiryDate) < new Date();
-        if (!coupon || !coupon.isActive || expired || coupon.usageCount >= coupon.usageLimit) {
-          throw ApiError.badRequest('This promo code is not available');
-        }
-        if (subtotal < toNum(coupon.minOrderAmount)) {
-          throw ApiError.badRequest(`This promo code requires a minimum order of KES ${toNum(coupon.minOrderAmount).toLocaleString()}`);
-        }
-        couponCode = coupon.code;
-        discount = roundMoney(Math.min(
-          coupon.discountType === 'PERCENTAGE'
-            ? (subtotal * toNum(coupon.discountValue)) / 100
-            : toNum(coupon.discountValue),
-          subtotal,
-        ));
-      }
-
-      const deliveryFee = subtotal >= FREE_DELIVERY_THRESHOLD ? 0 : DELIVERY_FEE_KES;
-      const total = roundMoney(subtotal - discount + deliveryFee);
-
-      // The conditional update is the stock authority. It prevents two
-      // simultaneous checkouts from both selling the same final unit.
-      for (const item of lineItems) {
-        const rows = await tx.$queryRaw<Array<{ stockQuantity: number }>>`
-          UPDATE "Variant"
-          SET "stockQuantity" = "stockQuantity" - ${item.quantity}
-          WHERE "id" = ${item.variantId}
-            AND "stockQuantity" >= ${item.quantity}
-          RETURNING "stockQuantity"
-        `;
-        if (rows.length !== 1) {
-          throw ApiError.outOfStock(`${item.title} (${item.size} / ${item.color}) no longer has enough stock`);
-        }
-
-        await tx.inventoryMovement.create({
-          data: {
-            variantId: item.variantId,
-            type: 'RESERVATION',
-            quantity: -item.quantity,
-            previousStock: rows[0].stockQuantity + item.quantity,
-            newStock: rows[0].stockQuantity,
-            reason: `E-commerce order reserved #${orderNumber}`,
-            referenceType: 'ECOM_ORDER',
-            referenceId: orderNumber,
-            actor: 'Storefront customer',
-          },
-        });
-      }
-
-      if (couponCode) {
-        const coupon = await tx.coupon.findUniqueOrThrow({
-          where: { code: couponCode },
-          select: { usageLimit: true },
-        });
-        const claim = await tx.coupon.updateMany({
-          where: {
-            code: couponCode,
-            isActive: true,
-            usageCount: { lt: coupon.usageLimit },
-          },
-          data: { usageCount: { increment: 1 } },
-        });
-        if (claim.count !== 1) {
-          throw ApiError.badRequest('This promo code is no longer available');
-        }
-      }
-
-      await tx.customer.upsert({
-        where: { phone: normalizedCustomerPhone },
-        update: {
-          name: data.customer.fullName,
-          email: data.customer.email || null,
-          county: data.customer.county,
-          city: data.customer.townCity,
-        },
-        create: {
-          name: data.customer.fullName,
-          phone: normalizedCustomerPhone,
-          email: data.customer.email || null,
-          county: data.customer.county,
-          city: data.customer.townCity,
-        },
-      });
-
-      return tx.order.create({
-        data: {
-          orderNumber,
-          trackingTokenHash: hashTrackingToken(trackingToken),
-          customerName: data.customer.fullName,
-          customerEmail: data.customer.email || '',
-          customerPhone: normalizedCustomerPhone,
-          customerCounty: data.customer.county,
-          customerTownCity: data.customer.townCity,
-          customerAddress: data.customer.address,
-          customerNotes: data.customer.notes,
-          items: JSON.stringify(lineItems),
-          subtotal,
-          discount,
-          couponCode,
-          deliveryFee,
-          total,
-          currency: 'KES',
-          paymentMethod: data.paymentMethod,
-          paymentStatus: 'PENDING',
-          fulfillmentStatus: 'PENDING',
-          mpesaPhone: data.paymentMethod === 'MPESA' ? data.mpesaPhone || null : null,
-          mpesaReceipt: null,
-          // M-PESA payments expire in 30 minutes if not confirmed
-          paymentExpiresAt: data.paymentMethod === 'MPESA'
-            ? new Date(Date.now() + 30 * 60 * 1000)
-            : null,
-        },
-      });
+    // ── Validate availability + calculate totals (read-only, no stock touch) ──
+    const variants = await prisma.variant.findMany({
+      where: { id: { in: [...quantities.keys()] }, product: { isActive: true } },
+      include: { product: { select: { id: true, title: true, images: true, isActive: true } } },
     });
-
-    // Emit OrderCreated after the transaction commits — never inside it.
-    eventBus.emit('OrderCreated', {
-      orderId: order.id,
-      orderNumber: order.orderNumber,
-      customerName: order.customerName,
-      customerPhone: order.customerPhone,
-      total: toNum(order.total),
-      paymentMethod: order.paymentMethod,
-    });
-
-    let paymentInitiated = false;
-    if (data.paymentMethod === 'MPESA' && data.mpesaPhone && isMpesaConfigured()) {
-      // Normalize the M-PESA phone. Use mpesaPhone if provided (customer may
-      // want a different number), otherwise fall back to normalizedCustomerPhone.
-      const mpesaPayPhone = normalizeMpesaPhone(data.mpesaPhone) ?? normalizedCustomerPhone;
-      // Generate a unique idempotency key and persist it BEFORE calling
-      // Safaricom. If the HTTP connection drops after Daraja accepts the
-      // request but before we receive the response, the key lets us
-      // correlate any callback that still arrives.
-      const idempotencyKey = crypto.randomBytes(16).toString('hex');
-      await prisma.order.update({
-        where: { id: order.id },
-        data: {
-          mpesaIdempotencyKey: idempotencyKey,
-          mpesaInitiatedAt: new Date(),
-        },
-      });
-
-      try {
-        const paymentRequest = await initiateMpesaStkPush({
-          orderNumber: order.orderNumber,
-          amount: toNum(order.total),
-          phone: mpesaPayPhone,
-        });
-        const saved = await prisma.order.updateMany({
-          where: { id: order.id, paymentStatus: 'PENDING', mpesaCheckoutRequestId: null },
-          data: {
-            mpesaCheckoutRequestId: paymentRequest.checkoutRequestId,
-            mpesaMerchantRequestId: paymentRequest.merchantRequestId,
-          },
-        });
-        paymentInitiated = saved.count === 1;
-      } catch (error) {
-        const errorClass = classifyMpesaInitiationError(error);
-        console.error(`M-PESA STK initiation ${errorClass === 'TIMEOUT' ? 'timed out' : 'failed'} for ${order.orderNumber}:`, error instanceof Error ? error.message : error);
-
-        if (errorClass === 'REJECTED') {
-          // Safaricom definitively refused — safe to fail and restore immediately.
-          await prisma.$transaction(async (tx) => {
-            await tx.order.updateMany({
-              where: { id: order.id, paymentStatus: 'PENDING' },
-              data: { paymentStatus: 'FAILED' },
-            });
-            await releaseFailedOrderReservation(tx, order, `M-PESA STK rejected for order #${order.orderNumber}`);
-            await tx.auditLog.create({
-              data: {
-                actor: 'Storefront checkout',
-                action: 'PAYMENT_FAILED',
-                details: `M-PESA STK rejected for order #${order.orderNumber}. Stock restored. Error: ${error instanceof Error ? error.message : 'unknown'}`,
-                ipAddress: req.ip,
-              },
-            });
-          });
-          throw ApiError.badRequest(
-            'M-PESA payment was rejected. Please try again or contact the shop.',
-            'PAYMENT_FAILED',
-          );
-        }
-
-        // TIMEOUT: ambiguous — leave PENDING for callback or reconciliation.
-        await prisma.order.updateMany({
-          where: { id: order.id, paymentStatus: 'PENDING' },
-          data: { paymentStatus: 'PENDING_CORRELATION' },
-        });
-        await prisma.auditLog.create({
-          data: {
-            actor: 'Storefront checkout',
-            action: 'PAYMENT_PENDING',
-            details: `M-PESA STK timed out for order #${order.orderNumber}. Marked PENDING_CORRELATION — awaiting callback or reconciliation. idempotencyKey recorded.`,
-            ipAddress: req.ip,
-          },
-        });
-        // paymentInitiated stays false — storefront shows "waiting for M-PESA" state.
-      }
+    if (variants.length !== quantities.size) {
+      throw ApiError.badRequest('One or more selected products are no longer available');
     }
 
-    // The bearer token is intentionally returned once, only to the customer
-    // who created the order. It prevents order-number guessing from exposing PII.
-    res.status(201).json({ ...serialiseOrder(order), trackingToken, paymentInitiated });
+    const variantsById = new Map(variants.map(v => [v.id, v]));
+    const lineItems = [...quantities.entries()].map(([variantId, quantity]) => {
+      const v = variantsById.get(variantId)!;
+      if (!v.product.isActive) throw ApiError.badRequest('One or more selected products are no longer available');
+      // Availability check — warn customer now rather than after payment
+      if (v.stockQuantity < quantity) {
+        throw ApiError.outOfStock(`${v.product.title} (${v.size}/${v.color}) — only ${v.stockQuantity} left`);
+      }
+      return {
+        productId: v.productId, variantId: v.id, title: v.product.title,
+        size: v.size, color: v.color,
+        price: toNum(v.salePrice ?? v.price),
+        quantity,
+        image: JSON.parse(v.product.images || '[]')[0] || '',
+      };
+    });
+
+    const subtotal = roundMoney(lineItems.reduce((s, i) => s + i.price * i.quantity, 0));
+    let couponCode: string | null = null;
+    let discount = 0;
+
+    const storeSettings = await prisma.storeSettings.findUnique({ where: { id: 'default' } });
+    const DELIVERY_FEE_KES        = storeSettings?.deliveryFeeKes          ?? 350;
+    const FREE_DELIVERY_THRESHOLD = storeSettings?.freeDeliveryThresholdKes ?? 10000;
+
+    if (data.couponCode) {
+      const coupon = await prisma.coupon.findUnique({ where: { code: data.couponCode } });
+      if (!coupon || !coupon.isActive || new Date(coupon.expiryDate) < new Date() || coupon.usageCount >= coupon.usageLimit) {
+        throw ApiError.badRequest('This promo code is not available');
+      }
+      if (subtotal < toNum(coupon.minOrderAmount)) {
+        throw ApiError.badRequest(`Minimum order KES ${toNum(coupon.minOrderAmount).toLocaleString()} required`);
+      }
+      couponCode = coupon.code;
+      discount = roundMoney(Math.min(
+        coupon.discountType === 'PERCENTAGE' ? (subtotal * toNum(coupon.discountValue)) / 100 : toNum(coupon.discountValue),
+        subtotal,
+      ));
+    }
+
+    const deliveryFee = subtotal >= FREE_DELIVERY_THRESHOLD ? 0 : DELIVERY_FEE_KES;
+    const total = roundMoney(subtotal - discount + deliveryFee);
+
+    // ── Create CheckoutSession — payment intent with no stock side-effects ──
+    const sessionRef = `GC-PAY-${Date.now().toString(36).toUpperCase()}-${crypto.randomBytes(3).toString('hex').toUpperCase()}`;
+    const expiresAt  = new Date(Date.now() + 30 * 60 * 1000); // 30-min window
+
+    const session = await (prisma as any).checkoutSession.create({
+      data: {
+        sessionRef,
+        customerName:     data.customer.fullName,
+        customerEmail:    data.customer.email || '',
+        customerPhone:    normalizedCustomerPhone,
+        customerCounty:   data.customer.county,
+        customerTownCity: data.customer.townCity,
+        customerAddress:  data.customer.address,
+        customerNotes:    data.customer.notes,
+        itemsJson:        JSON.stringify(lineItems),
+        subtotal,
+        discount,
+        couponCode,
+        deliveryFee,
+        total,
+        currency:       'KES',
+        paymentMethod:  data.paymentMethod,
+        status:         'AWAITING_PAYMENT',
+        expiresAt,
+      },
+    });
+
+    // Return session reference and Till instructions — no order number yet
+    const tillNumber = getTillNumber();
+    res.status(201).json({
+      sessionRef: session.sessionRef,
+      total,
+      deliveryFee,
+      discount,
+      couponCode,
+      expiresAt,
+      tillNumber,
+      status: 'AWAITING_PAYMENT',
+      message: tillNumber
+        ? `Pay KES ${total.toLocaleString()} to Till ${tillNumber} using reference ${sessionRef}. Your order will be confirmed automatically.`
+        : 'Till number not configured. Contact the shop via WhatsApp.',
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// ── GET /api/orders/checkout-session/:ref ─────────────────────────────────
+// Public: poll checkout session status. Returns AWAITING_PAYMENT, PAID,
+// EXPIRED, or FAILED. The storefront polls this after showing the Till
+// payment instructions, then redirects to order confirmation when PAID.
+router.get('/checkout-session/:ref', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const session = await (prisma as any).checkoutSession.findUnique({
+      where: { sessionRef: req.params.ref },
+      select: {
+        sessionRef: true, status: true, total: true, expiresAt: true,
+        orderId: true, couponCode: true,
+      },
+    });
+    if (!session) throw ApiError.notFound('Checkout session not found');
+
+    // If payment has been confirmed, include the order number for redirect
+    let orderNumber: string | null = null;
+    if (session.orderId) {
+      const order = await prisma.order.findUnique({
+        where: { id: session.orderId },
+        select: { orderNumber: true, trackingTokenHash: true },
+      });
+      orderNumber = order?.orderNumber ?? null;
+    }
+
+    res.json({
+      sessionRef: session.sessionRef,
+      status: session.status,
+      total: toNum(session.total),
+      expiresAt: session.expiresAt,
+      orderNumber,
+    });
   } catch (error) {
     next(error);
   }
@@ -569,7 +436,7 @@ router.post('/mpesa-callback', async (req: Request, res: Response, next: NextFun
 
       if (order) {
         const paid = await tx.order.update({ where: { id: order.id }, data: { paymentStatus: 'PAID', mpesaReceipt: receipt.trim() } });
-        await queueOrderPaymentNotification(tx, { ...paid, paymentReference: paid.orderNumber });
+        await queueOrderPaymentNotification(tx, { ...paid, paymentReference: paid.orderNumber, actualPaymentAmount: paidAmount });
         // Capture event payload — emit AFTER transaction commits
         const evt = {
           orderId: paid.id, orderNumber: paid.orderNumber,
@@ -907,46 +774,30 @@ router.post('/mpesa-c2b-callback', async (req: Request, res: Response, next: Nex
 
     await prisma.$transaction(async (tx) => {
       // ── Attempt 1: match by BillRefNumber (receipt/order number) ──────────
-      // Cashier tells customer: "Pay Till XXXXX, reference GC-POS-ABCDE"
-      let matchedOrder: any = null;
-      let matchedSale:  any = null;
+        // Cashier tells customer: "Pay Till XXXXX, reference GC-POS-ABCDE"
+        let matchedOrder: any = null;
+        let matchedSale:  any = null;
+        let matchedSession: any = null;
 
-      if (ref) {
-        matchedOrder = await tx.order.findFirst({
-          where: { orderNumber: ref, paymentStatus: { in: ['PENDING', 'PENDING_CORRELATION'] } },
-        });
-        if (!matchedOrder) {
-          matchedSale = await (tx as any).posSale.findFirst({
-            where: { receiptNumber: ref, paymentStatus: { in: ['PENDING', 'PENDING_CORRELATION'] } },
-          });
+        if (ref) {
+          // CheckoutSession reference (website C2B payment — payment-first)
+          matchedSession = await tx.checkoutSession.findUnique({
+            where: { sessionRef: ref, status: 'AWAITING_PAYMENT' },
+          }).catch(() => null);
+
+          if (!matchedSession) {
+            // Existing POS sale reference — BillRefNumber only, no phone+amount fallback
+            matchedSale = await (tx as any).posSale.findFirst({
+              where: { receiptNumber: ref, paymentStatus: { in: ['PENDING', 'PENDING_CORRELATION'] } },
+            });
+          }
         }
-      }
 
-      // ── Attempt 2: match by phone + amount where reference missing ────────
-      if (!matchedOrder && !matchedSale) {
-        matchedOrder = await tx.order.findFirst({
-          where: {
-            customerPhone: phone,
-            paymentStatus: { in: ['PENDING', 'PENDING_CORRELATION'] },
-            // amount tolerance ±1 shilling
-            total: { gte: amount - 1, lte: amount + 1 } as any,
-          },
-          orderBy: { createdAt: 'desc' },
-        });
-        if (!matchedOrder) {
-          matchedSale = await (tx as any).posSale.findFirst({
-            where: {
-              customerPhone: phone,
-              paymentStatus: { in: ['PENDING', 'PENDING_CORRELATION'] },
-              total: { gte: amount - 1, lte: amount + 1 } as any,
-            },
-            orderBy: { createdAt: 'desc' },
-          });
-        }
-      }
-
-      // ── No safe match: create UnmatchedPayment for owner review ───────────
-      if (!matchedOrder && !matchedSale) {
+        // ── No safe match: create UnmatchedPayment for owner review ───────────
+        // We deliberately do NOT fall back to phone+amount matching — that
+        // risks confirming the wrong transaction when two customers pay the
+        // same amount. Owner manually assigns via the Unmatched Payments panel.
+        if (!matchedOrder && !matchedSale && !matchedSession) {
         await (tx as any).unmatchedPayment.upsert({
           where: { mpesaReceipt: receipt },
           update: {},
@@ -971,57 +822,108 @@ router.post('/mpesa-c2b-callback', async (req: Request, res: Response, next: Nex
       }
 
       // ── Match found: verify amount and mark paid ──────────────────────────
-      const payment = (matchedOrder || matchedSale)!;
-      const toNum   = (v: any) => (v && typeof v === 'object' ? v.toNumber() : Number(v));
-      const expectedAmount = toNum(payment.total);
+      const payment = (matchedSession || matchedOrder || matchedSale)!;
+      const toNumC2B = (v: any) => (v && typeof v === 'object' ? v.toNumber() : Number(v));
+      const expectedAmount = toNumC2B(payment.total);
 
       if (Math.abs(amount - expectedAmount) > 1) {
-        // Amount mismatch → unmatched for review
         await (tx as any).unmatchedPayment.upsert({
           where: { mpesaReceipt: receipt },
           update: {},
-          create: {
-            mpesaReceipt: receipt,
-            amount,
-            phone,
-            payerName,
-            rawPayload: JSON.stringify(payload),
-            status: 'UNMATCHED',
-          },
+          create: { mpesaReceipt: receipt, amount, phone, payerName, rawPayload: JSON.stringify(payload), status: 'UNMATCHED' },
         });
         await tx.auditLog.create({
-          data: {
-            actor: 'M-PESA C2B service',
-            action: 'PAYMENT_REQUIRES_REVIEW',
-            details: `C2B amount mismatch for ${matchedOrder ? matchedOrder.orderNumber : matchedSale.receiptNumber}: expected ${expectedAmount}, received ${amount}`,
-            ipAddress: req.ip,
-          },
+          data: { actor: 'M-PESA C2B service', action: 'PAYMENT_REQUIRES_REVIEW',
+            details: `C2B amount mismatch for ref ${ref}: expected ${expectedAmount}, received ${amount}`, ipAddress: req.ip },
         });
         return;
       }
 
-      // All checks passed — mark as PAID
-      if (matchedOrder) {
-        const paid = await tx.order.update({
-          where: { id: matchedOrder.id },
-          data: { paymentStatus: 'PAID', mpesaReceipt: receipt },
+      // ── CheckoutSession path: create Order + deduct stock atomically ──────
+      if (matchedSession) {
+        const sess = matchedSession;
+        const lineItems = JSON.parse(sess.itemsJson) as Array<{
+          variantId: string; productId: string; title: string;
+          size: string; color: string; price: number; quantity: number; image: string;
+        }>;
+        const orderNumber   = newOrderNumber();
+        const trackingToken = crypto.randomBytes(32).toString('base64url');
+
+        for (const item of lineItems) {
+          const rows = await tx.$queryRaw<Array<{ stockQuantity: number }>>`
+            UPDATE "Variant" SET "stockQuantity" = "stockQuantity" - ${item.quantity}
+            WHERE "id" = ${item.variantId} AND "stockQuantity" >= ${item.quantity}
+            RETURNING "stockQuantity"
+          `;
+          if (rows.length !== 1) {
+            await (tx as any).unmatchedPayment.upsert({
+              where: { mpesaReceipt: receipt },
+              update: {},
+              create: { mpesaReceipt: receipt, amount, phone, payerName, rawPayload: JSON.stringify(payload),
+                status: 'UNMATCHED', resolutionNote: `Out of stock at confirmation: ${item.title} — refund required` },
+            });
+            return;
+          }
+          await tx.inventoryMovement.create({
+            data: { variantId: item.variantId, type: 'SALE', quantity: -item.quantity,
+              previousStock: rows[0].stockQuantity + item.quantity, newStock: rows[0].stockQuantity,
+              reason: `C2B confirmed order #${orderNumber}`, referenceType: 'ECOM_ORDER',
+              referenceId: orderNumber, actor: 'C2B payment service' },
+          });
+        }
+
+        if (sess.couponCode) {
+          await tx.coupon.updateMany({
+            where: { code: sess.couponCode, isActive: true },
+            data: { usageCount: { increment: 1 } },
+          });
+        }
+
+        await tx.customer.upsert({
+          where: { phone: sess.customerPhone },
+          update: { name: sess.customerName, county: sess.customerCounty, city: sess.customerTownCity },
+          create: { name: sess.customerName, phone: sess.customerPhone, email: sess.customerEmail || null, county: sess.customerCounty, city: sess.customerTownCity },
         });
+
+        const order = await tx.order.create({
+          data: {
+            orderNumber, trackingTokenHash: hashTrackingToken(trackingToken),
+            customerName: sess.customerName, customerEmail: sess.customerEmail || '',
+            customerPhone: sess.customerPhone, customerCounty: sess.customerCounty,
+            customerTownCity: sess.customerTownCity, customerAddress: sess.customerAddress,
+            customerNotes: sess.customerNotes, items: sess.itemsJson,
+            subtotal: sess.subtotal, discount: sess.discount, couponCode: sess.couponCode,
+            deliveryFee: sess.deliveryFee, total: sess.total, currency: sess.currency,
+            paymentMethod: 'MPESA', paymentStatus: 'PAID', fulfillmentStatus: 'PENDING',
+            mpesaReceipt: receipt,
+          },
+        });
+
+        await (tx as any).checkoutSession.update({
+          where: { id: sess.id },
+          data: { status: 'PAID', mpesaReceipt: receipt, orderId: order.id },
+        });
+
+        await queueOrderPaymentNotification(tx, { ...order, paymentReference: order.orderNumber, actualPaymentAmount: amount });
+        await tx.auditLog.create({
+          data: { actor: 'M-PESA C2B service', action: 'PAYMENT_CONFIRMED',
+            details: `C2B ${receipt} KES ${amount}: session ${sess.sessionRef} confirmed. Order #${orderNumber} created, stock deducted.`, ipAddress: req.ip },
+        });
+        return;
+      }
+
+      // All checks passed — mark existing order/sale as PAID
+      if (matchedOrder) {
+        const paid = await tx.order.update({ where: { id: matchedOrder.id }, data: { paymentStatus: 'PAID', mpesaReceipt: receipt } });
         await queueOrderPaymentNotification(tx, { ...paid, paymentReference: paid.orderNumber });
       } else {
-        const paid = await (tx as any).posSale.update({
-          where: { id: matchedSale.id },
-          data: { paymentStatus: 'PAID', mpesaReceipt: receipt },
-        });
+        const paid = await (tx as any).posSale.update({ where: { id: matchedSale.id }, data: { paymentStatus: 'PAID', mpesaReceipt: receipt } });
         await queuePosSalePaymentNotification(tx, { ...paid, paymentReference: paid.receiptNumber, currency: 'KES' });
       }
 
       await tx.auditLog.create({
-        data: {
-          actor: 'M-PESA C2B service',
-          action: 'PAYMENT_CONFIRMED',
-          details: `C2B payment ${receipt} KES ${amount} from ${phone} confirmed for ${matchedOrder ? matchedOrder.orderNumber : matchedSale.receiptNumber}`,
-          ipAddress: req.ip,
-        },
+        data: { actor: 'M-PESA C2B service', action: 'PAYMENT_CONFIRMED',
+          details: `C2B payment ${receipt} KES ${amount} from ${phone} confirmed for ref ${ref}`, ipAddress: req.ip },
       });
     });
 
