@@ -74,6 +74,10 @@ const CustomerSchema = z.object({
   notes: z.string().trim().max(1000).optional().default(''),
 }).strict();
 
+const RequestedDeliveryDateSchema = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'Use YYYY-MM-DD')
+  .transform(value => new Date(`${value}T12:00:00.000Z`))
+  .refine(value => !Number.isNaN(value.getTime()) && value >= new Date(new Date().toISOString().slice(0, 10)), 'Delivery date cannot be in the past');
+
 const CheckoutSchema = z.object({
   customer: CustomerSchema,
   items: z.array(z.object({
@@ -88,6 +92,7 @@ const CheckoutSchema = z.object({
   // mpesaPhone is optional — C2B Till payments don't require the customer's phone.
   // If provided it is used for order correlation and customer record.
   mpesaPhone: z.string().trim().regex(/^\+?[0-9]{9,15}$/, 'Enter a valid M-PESA phone number').optional(),
+  requestedDeliveryDate: RequestedDeliveryDateSchema.optional(),
 }).strict();
 
 const OrderUpdateSchema = z.object({
@@ -262,6 +267,7 @@ router.post('/', async (req: Request, res: Response, next: NextFunction) => {
         customerTownCity: data.customer.townCity,
         customerAddress:  data.customer.address,
         customerNotes:    data.customer.notes,
+        requestedDeliveryDate: data.requestedDeliveryDate,
         itemsJson:        JSON.stringify(lineItems),
         subtotal,
         discount,
@@ -1009,6 +1015,7 @@ router.post('/c2b-callback', async (req: Request, res: Response, next: NextFunct
             customerNotes: sess.customerNotes, items: sess.itemsJson,
             subtotal: sess.subtotal, discount: sess.discount, couponCode: sess.couponCode,
             deliveryFee: sess.deliveryFee, total: sess.total, currency: sess.currency,
+            orderedAt: sess.createdAt, requestedDeliveryDate: sess.requestedDeliveryDate,
             paymentMethod: 'MPESA', paymentStatus: 'PAID', fulfillmentStatus: 'PENDING',
             mpesaReceipt: receipt,
           },

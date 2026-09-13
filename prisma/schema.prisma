@@ -71,6 +71,8 @@ model Order {
   mpesaPhone             String?
   mpesaReceipt           String?              @unique
   createdAt              DateTime             @default(now())
+  orderedAt              DateTime             @default(now())
+  requestedDeliveryDate  DateTime?
   trackingTokenHash      String               @unique
   mpesaIdempotencyKey    String?              @unique
   mpesaCheckoutRequestId String?              @unique
@@ -145,6 +147,7 @@ model CheckoutSession {
   paymentMethod   String    @default("MPESA")
   status          String    @default("AWAITING_PAYMENT") // AWAITING_PAYMENT | PAID | EXPIRED | FAILED
   createdAt       DateTime  @default(now())
+  requestedDeliveryDate DateTime?
   expiresAt       DateTime
   mpesaReceipt    String?   @unique
   orderId         String?   @unique  // set after Order is created on payment confirmation

@@ -1,0 +1,2 @@
+ALTER TABLE "Order" ADD COLUMN "orderedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP, ADD COLUMN "requestedDeliveryDate" TIMESTAMP(3);
+ALTER TABLE "CheckoutSession" ADD COLUMN "requestedDeliveryDate" TIMESTAMP(3);
