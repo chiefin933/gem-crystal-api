@@ -195,7 +195,7 @@ async function requirePosSession(req: Request, res: Response, next: NextFunction
 // successful receipt by calling POST /payment-notifications/:id/acknowledge.
 router.get('/payment-notifications', requirePosSession, async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const session = (req as any).posSession as { id: string; cashierId: string };
+    const session = (req as any).posSession as { cashierId: string };
 
     // Only surface notifications for POS sales that belong to this session.
     // We join through posSaleId → PosSale.sessionId for session-scoped delivery.
@@ -204,11 +204,11 @@ router.get('/payment-notifications', requirePosSession, async (req: Request, res
       where: {
         acknowledgedAt: null,
         posSaleId: { not: null },
-        posSale: { sessionId: session.id },
+        posSale: { cashierId: session.cashierId },
       },
       orderBy: { createdAt: 'asc' },
       take: 20,
-      include: { posSale: { select: { sessionId: true } } },
+      include: { posSale: { select: { cashierId: true } } },
     });
 
     res.json({
