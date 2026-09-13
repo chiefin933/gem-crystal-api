@@ -106,6 +106,10 @@ async function main() {
         description: item.description,
         images: JSON.stringify(item.images),
         sizes: JSON.stringify(item.sizes),
+  await prisma.product.updateMany({
+    where: { slug: { in: ['demo-rose-tailored-blazer', 'demo-midnight-straight-jeans'] } },
+    data: { isActive: false },
+  });
         colors: JSON.stringify(item.colors),
       },
     });
