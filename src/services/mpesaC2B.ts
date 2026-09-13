@@ -60,16 +60,16 @@ export function isC2BConfigured(): boolean {
     process.env.MPESA_CONSUMER_KEY &&
     process.env.MPESA_CONSUMER_SECRET &&
     process.env.MPESA_SHORTCODE &&
-    process.env.MPESA_CALLBACK_URL &&
-    process.env.MPESA_CALLBACK_SECRET &&
+    process.env.MPESA_C2B_CALLBACK_URL &&
+    process.env.MPESA_C2B_CALLBACK_SECRET &&
     getTillNumber()
   );
 }
 
 /** Timing-safe comparison of the C2B callback secret. */
 export function c2bSecretMatches(candidate: unknown): boolean {
-  const secret = process.env.MPESA_CALLBACK_SECRET;
-  if (!secret || typeof candidate !== 'string' || candidate.length > 256) return false;
+  const secret = process.env.MPESA_C2B_CALLBACK_SECRET;
+  if (!secret || typeof candidate !== 'string' || candidate.length > 1024) return false;
   const expected = Buffer.from(secret);
   const received = Buffer.from(candidate);
   return expected.length === received.length && crypto.timingSafeEqual(expected, received);
@@ -106,14 +106,18 @@ export async function registerC2BUrls(): Promise<{ ResponseCode: string; Respons
   const env = process.env.MPESA_ENV === 'production' ? 'production' : 'sandbox';
   const base = env === 'production' ? 'https://api.safaricom.co.ke' : 'https://sandbox.safaricom.co.ke';
   const token = await getAccessToken();
-  const callbackUrl = process.env.MPESA_CALLBACK_URL!;
-  const secret = process.env.MPESA_CALLBACK_SECRET!;
+  const callbackUrl = process.env.MPESA_C2B_CALLBACK_URL!;
+  const secret = process.env.MPESA_C2B_CALLBACK_SECRET!;
 
-  // Embed secret as query param (same pattern as STK callback)
-  const confirmUrl = `${callbackUrl}?token=${secret}`;
-  const validationUrl = `${callbackUrl}/validation?token=${secret}`;
+  // URLSearchParams escapes arbitrary secret characters such as +, /, and =.
+  const confirmationUrl = new URL(callbackUrl);
+  confirmationUrl.searchParams.set('token', secret);
 
-  const res = await fetchJson(`${base}/mpesa/c2b/v1/registerurl`, {
+  const validationUrl = new URL(callbackUrl);
+  validationUrl.pathname = `${validationUrl.pathname.replace(/\/$/, '')}/validation`;
+  validationUrl.searchParams.set('token', secret);
+
+  const res = await fetchJson(`${base}/mpesa/c2b/v2/registerurl`, {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${token}`,
@@ -122,8 +126,8 @@ export async function registerC2BUrls(): Promise<{ ResponseCode: string; Respons
     body: JSON.stringify({
       ShortCode: process.env.MPESA_SHORTCODE,
       ResponseType: 'Completed',
-      ConfirmationURL: confirmUrl,
-      ValidationURL: validationUrl,
+      ConfirmationURL: confirmationUrl.toString(),
+      ValidationURL: validationUrl.toString(),
     }),
   }) as any;
 

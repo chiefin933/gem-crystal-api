@@ -21,9 +21,17 @@ import {
   isC2BConfigured,
   normalizeC2BPhone,
   registerC2BUrls,
+
 } from '../services/mpesaC2B';
 
 const router = Router();
+
+const RouteParamSchema = z.string().trim().min(1).max(128);
+function validRouteParam(value: unknown, name: string): string {
+  const parsed = RouteParamSchema.safeParse(value);
+  if (!parsed.success) throw ApiError.badRequest(`Invalid ${name}`);
+  return parsed.data;
+}
 
 /**
  * toNum — safely converts a Prisma Decimal (or plain number) to a JS number.
@@ -35,6 +43,27 @@ function toNum(v: { toNumber(): number } | number | null | undefined): number {
   return typeof v === 'object' ? v.toNumber() : Number(v);
 }
 
+
+/** Compare Kenyan-shilling amounts as integer cents, never floating-point values. */
+function kesToCents(value: unknown): number | null {
+  const text = value && typeof value === 'object' && 'toFixed' in value
+    ? (value as { toFixed: (digits: number) => string }).toFixed(2)
+    : String(value);
+  const match = /^(0|[1-9]\d*)(?:\.(\d{1,2}))?$/.exec(text);
+  if (!match) return null;
+
+  const whole = Number(match[1]);
+  if (!Number.isSafeInteger(whole)) return null;
+  const fractional = Number((match[2] ?? '').padEnd(2, '0'));
+  const cents = whole * 100 + fractional;
+  return Number.isSafeInteger(cents) ? cents : null;
+}
+
+function hasSameKesAmount(left: unknown, right: unknown): boolean {
+  const leftCents = kesToCents(left);
+  const rightCents = kesToCents(right);
+  return leftCents !== null && leftCents === rightCents;
+}
 const CustomerSchema = z.object({
   fullName: z.string().trim().min(2).max(120),
   email: z.string().trim().email().max(254).optional().or(z.literal('')),
@@ -129,32 +158,11 @@ function callbackValue(items: Array<{ Name: string; Value?: string | number | nu
   return items.find(item => item.Name === name)?.Value ?? null;
 }
 
-// releaseFailedPosSaleReservation is kept local since it's only used in the M-PESA callback here
-async function releaseFailedPosSaleReservation(tx: any, sale: any, reason: string): Promise<void> {
-  const items = JSON.parse(sale.items) as Array<{ variantId: string; quantity: number }>;
-  for (const item of items) {
-    if (!item.variantId || !Number.isInteger(item.quantity) || item.quantity < 1) continue;
-    const variant = await tx.variant.findUnique({ where: { id: item.variantId } });
-    if (!variant) continue;
-    const restored = await tx.variant.update({
-      where: { id: item.variantId },
-      data: { stockQuantity: { increment: item.quantity } },
-      select: { stockQuantity: true },
-    });
-    await tx.inventoryMovement.create({
-      data: {
-        variantId: item.variantId,
-        type: 'RETURN',
-        quantity: item.quantity,
-        previousStock: restored.stockQuantity - item.quantity,
-        newStock: restored.stockQuantity,
-        reason,
-        referenceType: 'POS_SALE',
-        referenceId: sale.receiptNumber,
-        actor: 'M-PESA payment service',
-      },
-    });
-  }
+// releaseFailedPosSaleReservation — no stock operation under payment-first POS architecture.
+// Stock is only deducted at completeSaleAtomically(), never at checkout, so there
+// is nothing to restore when a pending M-PESA sale fails or expires.
+async function releaseFailedPosSaleReservation(_tx: any, _sale: any, _reason: string): Promise<void> {
+  // Intentionally empty — no inventory side-effect
 }
 
 // ── POST /api/orders ──────────────────────────────────────────────────────
@@ -297,7 +305,7 @@ router.get('/checkout-session/:ref', async (req: Request, res: Response, next: N
       where: { sessionRef: req.params.ref },
       select: {
         sessionRef: true, status: true, total: true, expiresAt: true,
-        orderId: true, couponCode: true,
+        orderId: true, mpesaReceipt: true, couponCode: true,
       },
     });
     if (!session) throw ApiError.notFound('Checkout session not found');
@@ -318,14 +326,52 @@ router.get('/checkout-session/:ref', async (req: Request, res: Response, next: N
       total: toNum(session.total),
       expiresAt: session.expiresAt,
       orderNumber,
+      mpesaReceipt: session.mpesaReceipt,
     });
   } catch (error) {
     next(error);
   }
 });
 
-// ── GET /api/orders/:orderNumber ──────────────────────────────────────────
+// ── GET /api/orders/till-number ───────────────────────────────────────────
+// Public: returns the configured Till number so the storefront and POS
+// can display it. Must be BEFORE /:orderNumber to avoid the dynamic route
+// catching 'till-number' as an order number.
+router.get('/till-number', (_req: Request, res: Response) => {
+  const till = getTillNumber();
+  res.json({ tillNumber: till ?? null, configured: !!till });
+});
+
+// ── GET /api/orders/unmatched-payments ────────────────────────────────────
+// Owner: list unmatched C2B Till payments requiring manual review.
+router.get('/unmatched-payments', requireAdmin, requireRole('OWNER'), async (req: AuthRequest, res: Response, next: NextFunction) => {
+  try {
+    const page  = Math.max(1, parseInt(String(req.query.page  ?? 1), 10));
+    const limit = Math.min(100, Math.max(1, parseInt(String(req.query.limit ?? 50), 10)));
+    const skip  = (page - 1) * limit;
+
+    const [payments, total] = await Promise.all([
+      (prisma as any).unmatchedPayment.findMany({
+        where: { status: 'UNMATCHED' },
+        orderBy: { receivedAt: 'desc' },
+        skip,
+        take: limit,
+      }),
+      (prisma as any).unmatchedPayment.count({ where: { status: 'UNMATCHED' } }),
+    ]);
+
+    res.json({
+      data: payments,
+      pagination: { page, limit, total, totalPages: Math.ceil(total / limit) },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
 // Public customer tracking requires the one-time token returned at checkout.
+// ── GET /api/orders/:orderNumber ──────────────────────────────────────────
+// IMPORTANT: All static GET routes must appear ABOVE this dynamic route.
 router.get('/:orderNumber', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const trackingToken = req.header('X-Order-Tracking-Token');
@@ -333,7 +379,8 @@ router.get('/:orderNumber', async (req: Request, res: Response, next: NextFuncti
       throw ApiError.unauthorized('Order tracking token required');
     }
 
-    const order = await prisma.order.findUnique({ where: { orderNumber: req.params.orderNumber } });
+    const orderNumber = validRouteParam(req.params.orderNumber, 'order number');
+    const order = await prisma.order.findUnique({ where: { orderNumber } });
     if (
       !order ||
       !crypto.timingSafeEqual(
@@ -420,7 +467,7 @@ router.post('/mpesa-callback', async (req: Request, res: Response, next: NextFun
 
       if (
         typeof receipt !== 'string' || receipt.trim().length < 3 || receipt.length > 100 ||
-        !Number.isFinite(paidAmount) || Math.abs(paidAmount - toNum(payment.total)) > 0.01 ||
+        !Number.isFinite(paidAmount) || !hasSameKesAmount(paidAmount, payment.total) ||
         !paidPhone || !normalizedExpectedPhone || paidPhone !== normalizedExpectedPhone
       ) {
         await tx.auditLog.create({
@@ -501,15 +548,16 @@ router.get('/', requireAdmin, requireRole('OWNER'), async (req: AuthRequest, res
 router.put('/:id', requireAdmin, requireRole('OWNER'), async (req: AuthRequest, res: Response, next: NextFunction) => {
   try {
     const parsed = OrderUpdateSchema.safeParse(req.body);
+    const id = validRouteParam(req.params.id, 'order id');
     if (!parsed.success) {
       throw ApiError.badRequest('Validation failed', 'BAD_REQUEST', parsed.error.flatten());
     }
 
-    const existing = await prisma.order.findUnique({ where: { id: req.params.id } });
+    const existing = await prisma.order.findUnique({ where: { id } });
     if (!existing) throw ApiError.notFound('Order not found');
 
     const order = await prisma.order.update({
-      where: { id: req.params.id },
+      where: { id },
       data: parsed.data,
     });
 
@@ -545,6 +593,7 @@ router.put('/:id', requireAdmin, requireRole('OWNER'), async (req: AuthRequest, 
 router.post('/:id/payment-override', requireAdmin, requireRole('OWNER'), async (req: AuthRequest, res: Response, next: NextFunction) => {
   try {
     const parsed = PaymentOverrideSchema.safeParse(req.body);
+    const id = validRouteParam(req.params.id, 'order id');
     if (!parsed.success) {
       throw ApiError.badRequest('Validation failed', 'BAD_REQUEST', parsed.error.flatten());
     }
@@ -553,7 +602,7 @@ router.post('/:id/payment-override', requireAdmin, requireRole('OWNER'), async (
     const actor = req.adminEmail || req.adminId || 'OWNER';
 
     const order = await prisma.$transaction(async (tx) => {
-      const existing = await tx.order.findUnique({ where: { id: req.params.id } });
+      const existing = await tx.order.findUnique({ where: { id } });
       if (!existing) throw ApiError.notFound('Order not found');
 
       // Enforce allowed transition matrix
@@ -577,7 +626,7 @@ router.post('/:id/payment-override', requireAdmin, requireRole('OWNER'), async (
       }
 
       const updated = await tx.order.update({
-        where: { id: req.params.id },
+        where: { id },
         data: { paymentStatus: targetStatus },
       });
 
@@ -618,33 +667,6 @@ router.post('/:id/payment-override', requireAdmin, requireRole('OWNER'), async (
   }
 });
 
-// ── GET /api/orders/unmatched-payments ────────────────────────────────────
-// Owner: list unmatched C2B Till payments requiring manual review.
-router.get('/unmatched-payments', requireAdmin, requireRole('OWNER'), async (req: AuthRequest, res: Response, next: NextFunction) => {
-  try {
-    const page  = Math.max(1, parseInt(String(req.query.page  ?? 1), 10));
-    const limit = Math.min(100, Math.max(1, parseInt(String(req.query.limit ?? 50), 10)));
-    const skip  = (page - 1) * limit;
-
-    const [payments, total] = await Promise.all([
-      (prisma as any).unmatchedPayment.findMany({
-        where: { status: 'UNMATCHED' },
-        orderBy: { receivedAt: 'desc' },
-        skip,
-        take: limit,
-      }),
-      (prisma as any).unmatchedPayment.count({ where: { status: 'UNMATCHED' } }),
-    ]);
-
-    res.json({
-      data: payments,
-      pagination: { page, limit, total, totalPages: Math.ceil(total / limit) },
-    });
-  } catch (error) {
-    next(error);
-  }
-});
-
 // ── POST /api/orders/unmatched-payments/:id/resolve ───────────────────────
 // Owner: mark an unmatched payment as IGNORED or manually ASSIGN to order/sale.
 router.post('/unmatched-payments/:id/resolve', requireAdmin, requireRole('OWNER'), async (req: AuthRequest, res: Response, next: NextFunction) => {
@@ -670,31 +692,76 @@ router.post('/unmatched-payments/:id/resolve', requireAdmin, requireRole('OWNER'
     }
 
     const actor = req.adminEmail || req.adminId || 'OWNER';
+    const paidAmount = toNum(payment.amount);
 
     await prisma.$transaction(async (tx) => {
-      // If ASSIGNED, mark the target order/sale as PAID
       if (action === 'ASSIGNED' && targetType && targetRef) {
         if (targetType === 'ORDER') {
-          await tx.order.updateMany({
+          // Verify the order exists and is in a state that can be paid
+          const order = await tx.order.findFirst({
             where: { orderNumber: targetRef, paymentStatus: { in: ['PENDING', 'PENDING_CORRELATION'] } },
+          });
+          if (!order) throw ApiError.badRequest(`Order ${targetRef} not found or already paid`);
+
+          // Exact amount check
+          if (!hasSameKesAmount(payment.amount, order.total)) {
+            throw ApiError.badRequest(
+              `Payment amount KES ${paidAmount} does not match order total KES ${toNum(order.total)}`
+            );
+          }
+
+          await tx.order.update({
+            where: { id: order.id },
             data: { paymentStatus: 'PAID', mpesaReceipt: payment.mpesaReceipt },
           });
+
+          await queueOrderPaymentNotification(tx, {
+            ...order, paymentReference: order.orderNumber,
+            actualPaymentAmount: paidAmount,
+          } as any);
+
         } else {
-          await (tx as any).posSale.updateMany({
+          // POS sale — mark PAID and create SalePayment ledger entry
+          // Cashier must still call /complete to deduct stock
+          const sale = await (tx as any).posSale.findFirst({
             where: { receiptNumber: targetRef, paymentStatus: { in: ['PENDING', 'PENDING_CORRELATION'] } },
+          });
+          if (!sale) throw ApiError.badRequest(`POS sale ${targetRef} not found or already paid`);
+
+          if (!hasSameKesAmount(payment.amount, sale.total)) {
+            throw ApiError.badRequest(
+              `Payment amount KES ${paidAmount} does not match sale total KES ${toNum(sale.total)}`
+            );
+          }
+
+          await (tx as any).posSale.update({
+            where: { id: sale.id },
             data: { paymentStatus: 'PAID', mpesaReceipt: payment.mpesaReceipt },
           });
+
+          // Create SalePayment ledger entry
+          const existing = await (tx as any).salePayment.findFirst({
+            where: { posSaleId: sale.id, method: 'MPESA' },
+          });
+          if (!existing) {
+            await (tx as any).salePayment.create({
+              data: {
+                posSaleId: sale.id, method: 'MPESA',
+                amount: paidAmount, mpesaReceipt: payment.mpesaReceipt, status: 'CONFIRMED',
+              },
+            });
+          }
+
+          await queuePosSalePaymentNotification(tx, {
+            ...sale, paymentReference: sale.receiptNumber, currency: 'KES',
+            actualPaymentAmount: paidAmount,
+          } as any);
         }
       }
 
       await (tx as any).unmatchedPayment.update({
         where: { id: req.params.id },
-        data: {
-          status: action,
-          resolvedAt: new Date(),
-          resolvedBy: actor,
-          resolutionNote: note.trim(),
-        },
+        data: { status: action, resolvedAt: new Date(), resolvedBy: actor, resolutionNote: note.trim() },
       });
 
       await tx.auditLog.create({
@@ -702,12 +769,8 @@ router.post('/unmatched-payments/:id/resolve', requireAdmin, requireRole('OWNER'
           actor,
           action: 'UNMATCHED_PAYMENT_RESOLVED',
           details: JSON.stringify({
-            mpesaReceipt: payment.mpesaReceipt,
-            amount: payment.amount,
-            resolution: action,
-            note: note.trim(),
-            targetType,
-            targetRef,
+            mpesaReceipt: payment.mpesaReceipt, amount: paidAmount,
+            resolution: action, note: note.trim(), targetType, targetRef,
           }),
           ipAddress: req.ip,
         },
@@ -743,27 +806,61 @@ router.post('/mpesa-c2b-register', requireAdmin, requireRole('OWNER'), async (re
   }
 });
 
+// ── POST /api/orders/c2b-callback ─────────────────────────────────────────
 // ── POST /api/orders/mpesa-c2b-callback ───────────────────────────────────
 // Daraja sends this when a customer pays the Gem & Crystal Till.
 // We attempt to match the payment to a pending order or POS sale.
 // If no safe match is found, we create an UnmatchedPayment for owner review.
-router.post('/mpesa-c2b-callback', async (req: Request, res: Response, next: NextFunction) => {
-  // Always return 200 to Safaricom immediately — never let them retry on error
+const C2BCallbackSchema = z.object({
+  TransactionType: z.string().min(1).max(50),
+  TransID: z.string().min(1).max(100),
+  TransTime: z.string().min(1).max(20),
+  TransAmount: z.string().regex(/^\d+(\.\d{1,2})?$/, 'TransAmount must be a valid decimal'),
+  BusinessShortCode: z.string().min(1).max(20),
+  BillRefNumber: z.string().max(100).default(''),
+  MSISDN: z.string().min(9).max(15),
+  FirstName: z.string().max(100).optional().default(''),
+  MiddleName: z.string().max(100).optional().default(''),
+  LastName: z.string().max(100).optional().default(''),
+}).passthrough(); // allow extra fields Safaricom may add
+
+// Daraja calls ValidationURL before accepting a C2B payment. This endpoint is
+// deliberately side-effect free; confirmation remains the only finalization path.
+router.post('/c2b-callback/validation', (req: Request, res: Response) => {
+  const token = typeof req.query.token === 'string' ? req.query.token : undefined;
+  if (!c2bSecretMatches(token)) {
+    console.warn('[C2B] Rejected validation callback: invalid callback secret');
+    res.json({ ResultCode: 1, ResultDesc: 'Unauthorized validation callback' });
+    return;
+  }
+
+  const parsed = C2BCallbackSchema.safeParse(req.body);
+  if (!parsed.success || kesToCents(req.body?.TransAmount) === null) {
+    console.warn('[C2B] Rejected validation callback: malformed payload');
+    res.json({ ResultCode: 1, ResultDesc: 'Invalid C2B payment payload' });
+    return;
+  }
+
+  res.json({ ResultCode: 0, ResultDesc: 'Accepted' });
+});
+router.post('/c2b-callback', async (req: Request, res: Response, next: NextFunction) => {
   const accept = () => res.json({ ResultCode: 0, ResultDesc: 'Accepted' });
   const reject = (reason: string) => {
     console.warn('[C2B] Rejected callback:', reason);
-    res.json({ ResultCode: 0, ResultDesc: 'Accepted' }); // still 200 to prevent retries
+    res.json({ ResultCode: 0, ResultDesc: 'Accepted' }); // 200 to prevent Daraja retries
   };
 
   try {
     const token = typeof req.query.token === 'string' ? req.query.token : undefined;
     if (!c2bSecretMatches(token)) return reject('Invalid callback secret');
 
-    const payload = req.body as C2BPayload;
-    if (!payload?.TransID || !payload?.TransAmount || !payload?.MSISDN) {
-      return reject('Missing required callback fields');
+    const parsed = C2BCallbackSchema.safeParse(req.body);
+    if (!parsed.success) {
+      console.warn('[C2B] Invalid payload schema:', parsed.error.flatten());
+      return reject('Malformed C2B callback payload');
     }
 
+    const payload = parsed.data as C2BPayload;
     const amount   = parseFloat(payload.TransAmount);
     const receipt  = payload.TransID.trim();
     const phone    = normalizeC2BPhone(payload.MSISDN);
@@ -792,6 +889,24 @@ router.post('/mpesa-c2b-callback', async (req: Request, res: Response, next: Nex
             });
           }
         }
+
+      // ── Attempt 2: Buy Goods has no reference — exact, unique POS match ─
+      // There is no customer phone entry or account number for a Buy Goods Till.
+      // Auto-match only if one and only one still-live POS M-PESA sale has this
+      // exact amount. Multiple candidates deliberately remain unmatched for review.
+      if (!matchedOrder && !matchedSale && !matchedSession && !ref) {
+        const candidates = await (tx as any).posSale.findMany({
+          where: {
+            paymentMethod: 'MPESA',
+            paymentStatus: { in: ['PENDING', 'PENDING_CORRELATION'] },
+            paymentExpiresAt: { gt: new Date() },
+            total: amount,
+          },
+          orderBy: { createdAt: 'asc' },
+          take: 2,
+        });
+        if (candidates.length === 1) matchedSale = candidates[0];
+      }
 
         // ── No safe match: create UnmatchedPayment for owner review ───────────
         // We deliberately do NOT fall back to phone+amount matching — that
@@ -823,10 +938,10 @@ router.post('/mpesa-c2b-callback', async (req: Request, res: Response, next: Nex
 
       // ── Match found: verify amount and mark paid ──────────────────────────
       const payment = (matchedSession || matchedOrder || matchedSale)!;
-      const toNumC2B = (v: any) => (v && typeof v === 'object' ? v.toNumber() : Number(v));
-      const expectedAmount = toNumC2B(payment.total);
+      const expectedAmount = toNum(payment.total);
 
-      if (Math.abs(amount - expectedAmount) > 1) {
+      // Exact amount match in cents — even KES 0.01 means manual review.
+      if (!hasSameKesAmount(payload.TransAmount, payment.total)) {
         await (tx as any).unmatchedPayment.upsert({
           where: { mpesaReceipt: receipt },
           update: {},
@@ -917,7 +1032,14 @@ router.post('/mpesa-c2b-callback', async (req: Request, res: Response, next: Nex
         const paid = await tx.order.update({ where: { id: matchedOrder.id }, data: { paymentStatus: 'PAID', mpesaReceipt: receipt } });
         await queueOrderPaymentNotification(tx, { ...paid, paymentReference: paid.orderNumber });
       } else {
-        const paid = await (tx as any).posSale.update({ where: { id: matchedSale.id }, data: { paymentStatus: 'PAID', mpesaReceipt: receipt } });
+        const paid = await (tx as any).posSale.update({
+          where: { id: matchedSale.id },
+          data: {
+            paymentStatus: 'PAID', mpesaReceipt: receipt,
+            customerName: payerName || matchedSale.customerName,
+            customerPhone: phone || matchedSale.customerPhone,
+          },
+        });
         await queuePosSalePaymentNotification(tx, { ...paid, paymentReference: paid.receiptNumber, currency: 'KES' });
       }
 
@@ -932,14 +1054,6 @@ router.post('/mpesa-c2b-callback', async (req: Request, res: Response, next: Nex
     console.error('[C2B callback error]', error);
     return accept(); // always 200 to Safaricom
   }
-});
-
-// ── GET /api/orders/till-number ───────────────────────────────────────────
-// Public: returns the configured Till number so the storefront and POS
-// can display it to customers without embedding it in frontend code.
-router.get('/till-number', (_req: Request, res: Response) => {
-  const till = getTillNumber();
-  res.json({ tillNumber: till ?? null, configured: !!till });
 });
 
 export default router;

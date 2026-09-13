@@ -1,6 +1,18 @@
 import { Router, Request, Response } from 'express';
 import { prisma } from '../lib/prisma';
 import { requireAdmin, requireRole, AuthRequest } from '../middleware/auth';
+import { z } from 'zod';
+
+const SettingsSchema = z.object({
+  storeName: z.string().trim().min(2).max(120),
+  tagline: z.string().trim().min(2).max(200),
+  location: z.string().trim().min(2).max(200),
+  phone: z.string().trim().min(7).max(32),
+  whatsappNumber: z.string().trim().regex(/^\d{9,15}$/),
+  deliveryFeeDisclaimer: z.string().trim().min(2).max(1_000),
+  aiChatEnabled: z.boolean(),
+}).strict();
+
 
 const router = Router();
 
@@ -41,7 +53,9 @@ router.get('/', async (_req: Request, res: Response) => {
 // Admin: update store configuration.
 router.put('/', requireAdmin, requireRole('OWNER'), async (req: AuthRequest, res: Response) => {
   try {
-    const { storeName, tagline, location, phone, whatsappNumber, deliveryFeeDisclaimer, aiChatEnabled } = req.body;
+    const parsed = SettingsSchema.safeParse(req.body);
+    if (!parsed.success) { res.status(400).json({ error: 'Invalid settings data' }); return; }
+    const { storeName, tagline, location, phone, whatsappNumber, deliveryFeeDisclaimer, aiChatEnabled } = parsed.data;
 
     const settings = await prisma.storeSettings.upsert({
       where: { id: 'default' },

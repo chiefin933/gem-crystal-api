@@ -20,8 +20,8 @@ function requiredConfig(): MpesaConfig | null {
   const consumerSecret = process.env.MPESA_CONSUMER_SECRET;
   const shortCode = process.env.MPESA_SHORTCODE;
   const passkey = process.env.MPESA_PASSKEY;
-  const callbackUrl = process.env.MPESA_CALLBACK_URL;
-  const callbackSecret = process.env.MPESA_CALLBACK_SECRET;
+  const callbackUrl = process.env.MPESA_STK_CALLBACK_URL;
+  const callbackSecret = process.env.MPESA_STK_CALLBACK_SECRET;
   const environment = process.env.MPESA_ENV === 'production' ? 'production' : 'sandbox';
 
   if (!consumerKey || !consumerSecret || !shortCode || !passkey || !callbackUrl || !callbackSecret) {
@@ -30,7 +30,7 @@ function requiredConfig(): MpesaConfig | null {
 
   const url = new URL(callbackUrl);
   if (url.protocol !== 'https:' && environment === 'production') {
-    throw new Error('MPESA_CALLBACK_URL must use HTTPS in production');
+    throw new Error('MPESA_STK_CALLBACK_URL must use HTTPS in production');
   }
 
   return { consumerKey, consumerSecret, shortCode, passkey, callbackUrl, callbackSecret, environment };
@@ -46,7 +46,7 @@ export function isMpesaConfigured(): boolean {
 
 export function callbackSecretMatches(candidate: unknown): boolean {
   const config = requiredConfig();
-  if (!config || typeof candidate !== 'string' || candidate.length > 256) return false;
+  if (!config || typeof candidate !== 'string' || candidate.length > 1024) return false;
 
   const expected = Buffer.from(config.callbackSecret);
   const received = Buffer.from(candidate);

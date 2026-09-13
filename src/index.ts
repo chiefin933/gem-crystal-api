@@ -40,7 +40,7 @@ const configuredOrigins = [
 const allowedOrigins = new Set(
   process.env.NODE_ENV === 'production'
     ? configuredOrigins
-    : [...configuredOrigins, 'http://localhost:5173', 'http://localhost:5174', 'http://localhost:5175'],
+    : [...configuredOrigins, 'http://localhost:5173', 'http://localhost:5174', 'http://localhost:5175', 'http://localhost:5176', 'http://127.0.0.1:5173', 'http://127.0.0.1:5174', 'http://127.0.0.1:5175', 'http://127.0.0.1:5176'],
 );
 
 if (process.env.NODE_ENV === 'production' && allowedOrigins.size === 0) {
@@ -77,6 +77,16 @@ const checkoutLimiter = rateLimit({
   legacyHeaders: false,
 });
 
+// Checkout polling: customers poll every 3s waiting for M-PESA confirmation.
+// Must be much more permissive than the creation limiter.
+const checkoutPollLimiter = rateLimit({
+  windowMs: 5 * 60 * 1000,
+  max: 200,           // 200 polls / 5 min ≈ one customer polling for 10+ minutes
+  standardHeaders: true,
+  legacyHeaders: false,
+  skip: (req) => req.method !== 'GET',   // only apply to GET requests
+});
+
 // AI chat: 20 requests per 5 minutes per IP — keeps costs controlled
 // and prevents abuse while allowing normal conversation flow.
 const aiLimiter = rateLimit({
@@ -91,6 +101,19 @@ const aiLimiter = rateLimit({
   },
   standardHeaders: true,
   legacyHeaders: false,
+});
+
+const catalogueLimiter = rateLimit({
+  windowMs: 5 * 60 * 1000, max: 120, standardHeaders: true, legacyHeaders: false,
+  message: { error: 'Too many catalogue requests, please try again shortly' },
+});
+const couponValidationLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, max: 30, standardHeaders: true, legacyHeaders: false,
+  message: { valid: false, error: 'Too many coupon checks, please try again later' },
+});
+const uploadLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, max: 20, standardHeaders: true, legacyHeaders: false,
+  message: { error: 'Too many image uploads, please try again later' },
 });
 
 app.use(express.json({ limit: '5mb' }));
@@ -112,13 +135,22 @@ app.get('/api/health/ready', async (_req, res) => {
   }
 });
 
-app.use('/api/products', productsRouter);
-app.use('/api/orders', checkoutLimiter);
+app.use('/api/products', catalogueLimiter, productsRouter);
+// Apply creation limiter only to POST /api/orders (not GET polling or C2B callbacks)
+app.use('/api/orders', (req, res, next) => {
+  if (req.method === 'POST' && req.path === '/') return checkoutLimiter(req, res, next);
+  if (req.method === 'GET') return checkoutPollLimiter(req, res, next);
+  return next();
+});
 app.use('/api/orders', ordersRouter);
+app.use('/api/coupons', (req, res, next) => {
+  if (req.method === 'POST' && req.path === '/validate') return couponValidationLimiter(req, res, next);
+  return next();
+});
 app.use('/api/coupons', couponsRouter);
 app.use('/api/settings', settingsRouter);
 app.use('/api/pos', posRouter);
-app.use('/api/upload', uploadRouter);
+app.use('/api/upload', uploadLimiter, uploadRouter);
 app.use('/api/ai', aiLimiter);
 app.use('/api/ai', aiRouter);
 app.use('/api/admin/login', loginLimiter);

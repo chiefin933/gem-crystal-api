@@ -6,7 +6,8 @@ import { z } from 'zod';
 import { prisma } from '../lib/prisma';
 import { ApiError } from '../lib/ApiError';
 import { AuthRequest, requireAdmin, requireRole } from '../middleware/auth';
-import { isMpesaConfigured, normalizeMpesaPhone } from '../services/mpesa';
+import { normalizeMpesaPhone } from '../services/mpesa';
+import { isC2BConfigured } from '../services/mpesaC2B';
 import { eventBus } from '../events/EventBus';
 import { releaseFailedOrderReservation } from './orderHelpers';
 
@@ -82,31 +83,21 @@ const db = prisma as any;
 // ── Shared stock restoration helper ───────────────────────────────────────
 // Restores stock for all line items in a failed POS sale and records
 // inventory movements. Called when M-PESA initiation definitively fails.
-async function releaseFailedPosSaleReservation(tx: any, sale: any, reason: string): Promise<void> {
-  const items = JSON.parse(sale.items) as Array<{ variantId: string; quantity: number }>;
-  for (const item of items) {
-    if (!item.variantId || !Number.isInteger(item.quantity) || item.quantity < 1) continue;
-    const variant = await tx.variant.findUnique({ where: { id: item.variantId } });
-    if (!variant) continue;
-    const restored = await tx.variant.update({
-      where: { id: item.variantId },
-      data: { stockQuantity: { increment: item.quantity } },
-      select: { stockQuantity: true },
-    });
-    await tx.inventoryMovement.create({
-      data: {
-        variantId: item.variantId,
-        type: 'RETURN',
-        quantity: item.quantity,
-        previousStock: restored.stockQuantity - item.quantity,
-        newStock: restored.stockQuantity,
-        reason,
-        referenceType: 'POS_SALE',
-        referenceId: sale.receiptNumber,
-        actor: 'POS payment service',
-      },
-    });
-  }
+/**
+ * releaseFailedPosSaleReservation — called when a POS M-PESA sale fails or expires.
+ *
+ * IMPORTANT: Under the payment-first POS architecture, stock is NEVER deducted
+ * at checkout time. Stock only moves inside completeSaleAtomically() after the
+ * cashier confirms a paid sale. Therefore this function must NOT increment stock —
+ * there is nothing to restore. It only updates audit state.
+ *
+ * Legacy stock-restoration code has been deliberately removed to prevent
+ * phantom inventory increments on failed PENDING sales.
+ */
+async function releaseFailedPosSaleReservation(_tx: any, sale: any, reason: string): Promise<void> {
+  // No stock operation — nothing was deducted at checkout
+  // The caller is responsible for updating paymentStatus/saleStatus and AuditLog
+  void sale; void reason; // referenced by callers but no stock work needed
 }
 
 const REQUEST_TTL_MS = 2 * 60 * 1000;
@@ -224,6 +215,7 @@ router.get('/payment-notifications', requirePosSession, async (req: Request, res
       success: true,
       notifications: notifications.map((n: any) => ({
         id: n.id,
+        posSaleId: n.posSaleId,
         orderNumber: n.paymentReference,
         customerName: n.customerName,
         customerPhone: n.customerPhone,
@@ -725,13 +717,11 @@ router.post('/checkout', requirePosSession, async (req: Request, res: Response, 
     if (finalPaymentMethod === 'CASH' && Number(cashReceived) < serverTotal) {      throw ApiError.badRequest('Cash received is less than the sale total');
     }
 
-    const receiptNumber = offlineReceiptId || ('GC-POS-' + crypto.randomBytes(5).toString('hex').toUpperCase());
-    const finalCustomerName = customerName || 'Walk-in Customer';
-    const normalizedPhone = customerPhone ? normalizeMpesaPhone(String(customerPhone)) : null;
-    if (finalPaymentMethod === 'MPESA' && (!normalizedPhone || !isMpesaConfigured())) {
-      throw ApiError.badRequest(
-        !normalizedPhone ? 'A valid customer M-PESA phone number is required' : 'M-PESA is not configured',
-      );
+    const receiptNumber = offlineReceiptId || ('GCPOS' + crypto.randomBytes(3).toString('hex').toUpperCase());
+    const finalCustomerName = finalPaymentMethod === 'MPESA' ? 'M-PESA Customer' : (customerName || 'Walk-in Customer');
+    const normalizedPhone = finalPaymentMethod === 'MPESA' ? null : (customerPhone ? normalizeMpesaPhone(String(customerPhone)) : null);
+    if (finalPaymentMethod === 'MPESA' && !isC2BConfigured()) {
+      throw ApiError.badRequest('M-PESA Till payments are not configured. Check the Till number and C2B callback settings.');
     }
 
     const existingSale = await db.posSale.findUnique({ where: { receiptNumber } });
@@ -1043,7 +1033,7 @@ router.post('/expire-pending', requireAdmin, requireRole('OWNER'), async (req: A
           data: {
             actor: 'System',
             action: 'PAYMENT_FAILED',
-            details: `POS sale #${sale.receiptNumber} payment expired — stock restored`,
+            details: `POS sale #${sale.receiptNumber} payment expired before cashier completion — inventory unchanged`,
           },
         });
       });

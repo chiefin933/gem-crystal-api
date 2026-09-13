@@ -5,6 +5,12 @@ import { requireAdmin, requireRole, AuthRequest } from '../middleware/auth';
 
 const router = Router();
 
+
+const CouponCodeSchema = z.string().trim().toUpperCase().regex(/^[A-Z0-9_-]{3,32}$/);
+const CouponValidationSchema = z.object({
+  code: CouponCodeSchema,
+  orderTotal: z.number().finite().nonnegative().max(10_000_000),
+}).strict();
 /** Convert Prisma Decimal or number to plain JS number. */
 function toNum(v: { toNumber(): number } | number | null | undefined): number {
   if (v == null) return 0;
@@ -52,15 +58,14 @@ const CouponCreateSchema = z.object({
 // Public: validate a coupon code before checkout
 router.post('/validate', async (req: Request, res: Response) => {
   try {
-    const { code, orderTotal } = req.body as { code: string; orderTotal: number };
-
-    if (!code) {
-      res.status(400).json({ valid: false, error: 'No coupon code provided' });
+    const parsed = CouponValidationSchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ valid: false, error: 'Enter a valid coupon code and order total' });
       return;
     }
-
+    const { code, orderTotal } = parsed.data;
     const coupon = await prisma.coupon.findUnique({
-      where: { code: code.trim().toUpperCase() },
+      where: { code },
     });
 
     if (!coupon) {
@@ -159,11 +164,13 @@ router.post('/', requireAdmin, requireRole('OWNER'), async (req: AuthRequest, re
 // Admin: activate / deactivate a coupon
 router.patch('/:code/toggle', requireAdmin, requireRole('OWNER'), async (req: AuthRequest, res: Response) => {
   try {
-    const coupon = await prisma.coupon.findUnique({ where: { code: req.params.code } });
+    const parsedCode = CouponCodeSchema.safeParse(req.params.code);
+    if (!parsedCode.success) { res.status(400).json({ error: 'Invalid coupon code' }); return; }
+    const coupon = await prisma.coupon.findUnique({ where: { code: parsedCode.data } });
     if (!coupon) { res.status(404).json({ error: 'Coupon not found' }); return; }
 
     const updated = await prisma.coupon.update({
-      where: { code: req.params.code },
+      where: { code: parsedCode.data },
       data: { isActive: !coupon.isActive },
     });
     res.json(updated);
@@ -176,7 +183,9 @@ router.patch('/:code/toggle', requireAdmin, requireRole('OWNER'), async (req: Au
 // Admin: delete a coupon
 router.delete('/:code', requireAdmin, requireRole('OWNER'), async (req: AuthRequest, res: Response) => {
   try {
-    await prisma.coupon.delete({ where: { code: req.params.code } });
+    const parsedCode = CouponCodeSchema.safeParse(req.params.code);
+    if (!parsedCode.success) { res.status(400).json({ error: 'Invalid coupon code' }); return; }
+    await prisma.coupon.delete({ where: { code: parsedCode.data } });
     res.json({ success: true });
   } catch (error) {
     res.status(500).json({ error: 'Failed to delete coupon' });

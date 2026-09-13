@@ -5,7 +5,7 @@ import { requireAdmin, requireRole } from '../middleware/auth';
 import { ApiError } from '../lib/ApiError';
 
 const router = Router();
-const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
+const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -82,7 +82,7 @@ function uploadBufferToCloudinary(fileBuffer: Buffer, mimetype: string): Promise
 }
 
 // ── POST /api/upload/images ───────────────────────────────────────────────
-router.post('/images', requireAdmin, requireRole('OWNER'), upload.array('images', 8), async (req: Request, res: Response, next: NextFunction) => {
+router.post('/images', requireAdmin, requireRole('OWNER'), upload.array('images', 4), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const files = req.files as Express.Multer.File[];
     if (!files || files.length === 0) {

@@ -7,6 +7,8 @@ import { z } from 'zod';
 
 const router = Router();
 
+const ProductKeySchema = z.string().trim().min(1).max(128);
+
 // Helper: parse JSON fields back to JS objects/arrays
 function parseProduct(p: any) {
   return {
@@ -82,9 +84,12 @@ router.get('/', async (req: Request, res: Response) => {
 // ── GET /api/products/:id ─────────────────────────────────────────────────
 router.get('/:id', async (req: Request, res: Response) => {
   try {
+    const parsedId = ProductKeySchema.safeParse(req.params.id);
+    if (!parsedId.success) { res.status(400).json({ error: 'Invalid product identifier' }); return; }
+    const productKey = parsedId.data;
     const product = await prisma.product.findFirst({
       where: {
-        OR: [{ id: req.params.id }, { slug: req.params.id }],
+        OR: [{ id: productKey }, { slug: productKey }],
         isActive: true,
       },
       include: { variants: true },
@@ -197,6 +202,9 @@ const UpdateProductSchema = z.object({
 // product's variants are updated in the same transaction so the storefront
 // never serves stale pricing.
 router.put('/:id', requireAdmin, requireRole('OWNER'), async (req: AuthRequest, res: Response) => {
+  const parsedId = ProductKeySchema.safeParse(req.params.id);
+  if (!parsedId.success) { res.status(400).json({ error: 'Invalid product identifier' }); return; }
+  const productId = parsedId.data;
   const parsed = UpdateProductSchema.safeParse(req.body);
   if (!parsed.success) {
     res.status(400).json({
@@ -215,7 +223,7 @@ router.put('/:id', requireAdmin, requireRole('OWNER'), async (req: AuthRequest, 
       // Load the current product so we can compute onSale correctly when
       // only one of price/salePrice is supplied in a partial update.
       const existing = await tx.product.findUnique({
-        where: { id: req.params.id },
+        where: { id: productId },
         select: { price: true, salePrice: true },
       });
       if (!existing) throw ApiError.notFound('Product not found');
@@ -229,7 +237,7 @@ router.put('/:id', requireAdmin, requireRole('OWNER'), async (req: AuthRequest, 
         resolvedSalePrice != null && resolvedSalePrice > 0 && resolvedSalePrice < resolvedPrice;
 
       const updated = await tx.product.update({
-        where: { id: req.params.id },
+        where: { id: productId },
         data: {
           ...(data.title        !== undefined && { title: data.title }),
           ...(data.gender       !== undefined && { gender: data.gender }),
@@ -253,7 +261,7 @@ router.put('/:id', requireAdmin, requireRole('OWNER'), async (req: AuthRequest, 
       // Sync variant prices atomically when the product price authority changes
       if (priceChanging || salePriceChanging) {
         await tx.variant.updateMany({
-          where: { productId: req.params.id },
+          where: { productId },
           data: {
             ...(priceChanging     && { price: data.price! }),
             ...(salePriceChanging && { salePrice: data.salePrice }),
@@ -274,9 +282,12 @@ router.put('/:id', requireAdmin, requireRole('OWNER'), async (req: AuthRequest, 
 // ── DELETE /api/admin/products/:id ────────────────────────────────────────
 // Admin: soft-delete a product
 router.delete('/:id', requireAdmin, requireRole('OWNER'), async (req: AuthRequest, res: Response) => {
+  const parsedId = ProductKeySchema.safeParse(req.params.id);
+  if (!parsedId.success) { res.status(400).json({ error: 'Invalid product identifier' }); return; }
+  const productId = parsedId.data;
   try {
     await prisma.product.update({
-      where: { id: req.params.id },
+      where: { id: productId },
       data: { isActive: false },
     });
     res.json({ success: true });
