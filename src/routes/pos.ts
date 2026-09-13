@@ -882,9 +882,10 @@ router.get('/sales', requireAdmin, requireRole('OWNER'), async (req: AuthRequest
     const limit = Math.min(100, Math.max(1, parseInt(String(req.query.limit ?? 50), 10)));
     const skip  = (page - 1) * limit;
 
+    const completedSaleWhere = { saleStatus: 'COMPLETED', paymentStatus: 'PAID' };
     const [sales, total] = await Promise.all([
-      db.posSale.findMany({ orderBy: { createdAt: 'desc' }, skip, take: limit }),
-      db.posSale.count(),
+      db.posSale.findMany({ where: completedSaleWhere, orderBy: { createdAt: 'desc' }, skip, take: limit }),
+      db.posSale.count({ where: completedSaleWhere }),
     ]);
 
     res.json({
