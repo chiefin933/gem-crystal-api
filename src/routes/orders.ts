@@ -902,7 +902,7 @@ router.post('/c2b-callback', async (req: Request, res: Response, next: NextFunct
       // exact amount. Daraja's sandbox PayBill simulator always sends a bill reference,
       // so it may use this same narrow match only outside production.
       const isSandboxPayBill = process.env.MPESA_ENV !== 'production'
-        && payload.TransactionType === 'CustomerPayBillOnline';
+        && ['CustomerPayBillOnline', 'Pay Bill'].includes(payload.TransactionType);
       if (!matchedOrder && !matchedSale && !matchedSession && (!ref || isSandboxPayBill)) {
         const candidates = await (tx as any).posSale.findMany({
           where: {
