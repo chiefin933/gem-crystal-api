@@ -945,8 +945,8 @@ router.get('/audit-logs', requireAdmin, requireRole('OWNER'), async (req: AuthRe
 //
 // Guards enforced:
 //   • Active POS session required
-//   • Cashier can only complete their own sales (sessionId match)
-//   • Sale must exist and belong to this session
+//   • Cashier can only complete their own sales (cashierId match)
+//   • A cashier may finish an uncompleted sale after starting a new session
 //   • Payment must be PAID
 //   • Amount in the sale must be positive
 //   • Duplicate completion is safe (idempotent)
@@ -959,11 +959,9 @@ router.post('/sales/:id/complete', requirePosSession, async (req: Request, res: 
     const sale = await db.posSale.findUnique({ where: { id: req.params.id } });
     if (!sale) throw ApiError.notFound('POS sale not found');
 
-    // Session-scoped ownership: the sale must belong to this cashier's session
-    if (sale.sessionId && sale.sessionId !== session.id) {
-      throw ApiError.forbidden('This sale belongs to a different POS session');
-    }
-    if (sale.cashierId && sale.cashierId !== session.cashierId) {
+    // Cashier-scoped ownership: the same cashier may return after their POS
+    // session expires or is renewed, but another cashier must never complete it.
+    if (!sale.cashierId || sale.cashierId !== session.cashierId) {
       throw ApiError.forbidden('You can only complete your own sales');
     }
 
