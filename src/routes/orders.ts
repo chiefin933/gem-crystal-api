@@ -899,8 +899,11 @@ router.post('/c2b-callback', async (req: Request, res: Response, next: NextFunct
       // ── Attempt 2: Buy Goods has no reference — exact, unique POS match ─
       // There is no customer phone entry or account number for a Buy Goods Till.
       // Auto-match only if one and only one still-live POS M-PESA sale has this
-      // exact amount. Multiple candidates deliberately remain unmatched for review.
-      if (!matchedOrder && !matchedSale && !matchedSession && !ref) {
+      // exact amount. Daraja's sandbox PayBill simulator always sends a bill reference,
+      // so it may use this same narrow match only outside production.
+      const isSandboxPayBill = process.env.MPESA_ENV !== 'production'
+        && payload.TransactionType === 'CustomerPayBillOnline';
+      if (!matchedOrder && !matchedSale && !matchedSession && (!ref || isSandboxPayBill)) {
         const candidates = await (tx as any).posSale.findMany({
           where: {
             paymentMethod: 'MPESA',
