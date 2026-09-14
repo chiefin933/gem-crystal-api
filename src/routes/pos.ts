@@ -134,6 +134,61 @@ const PosAuthRequestSchema = z.object({
   biometricId: z.string().trim().max(200).optional(),
 }).strict();
 
+
+// These schemas are the API boundary for the terminal. The browser UI is not
+// a trust boundary: a modified client can send any JSON, so unknown fields and
+// values outside these business limits are rejected before touching the DB.
+const MoneySchema = z.number().finite().min(0).max(1_000_000).refine(
+  value => Number.isSafeInteger(Math.round(value * 100)),
+  'Amount must have at most two decimal places',
+);
+const PlainCustomerNameSchema = z.string().trim().min(2).max(120).regex(
+  /^[\p{L}\p{M}0-9][\p{L}\p{M}0-9 .,'-]*$/u,
+  'Customer name contains unsupported characters',
+);
+const ReceiptReferenceSchema = z.string().trim().min(3).max(100).regex(
+  /^[A-Za-z0-9_-]+$/,
+  'Receipt reference must use letters, numbers, hyphens, or underscores only',
+);
+const PosCheckoutSchema = z.object({
+  customerName: PlainCustomerNameSchema.optional(),
+  customerPhone: z.string().trim().regex(/^\+?[0-9]{9,15}$/, 'Enter a valid phone number').nullable().optional(),
+  mpesaReceipt: ReceiptReferenceSchema.optional(),
+  items: z.array(z.object({
+    variantId: z.string().trim().min(1).max(128),
+    quantity: z.number().int().min(1).max(20),
+  }).strict()).min(1).max(25),
+  discountPercent: z.number().int().min(0).max(20).optional().default(0),
+  paymentMethod: z.enum(['CASH', 'MPESA']),
+  cashReceived: MoneySchema.nullable().optional(),
+  offlineReceiptId: z.string().trim().max(128).regex(/^GCPOS[A-Z0-9_-]{1,120}$/).optional(),
+}).strict();
+
+const HardwareUpdateSchema = z.object({
+  tabletName: z.string().trim().min(2).max(120).optional(),
+  tabletConnected: z.boolean().optional(),
+  barcodeScanner: z.boolean().optional(),
+  fingerprintReader: z.boolean().optional(),
+  receiptPrinter: z.boolean().optional(),
+  cashDrawer: z.boolean().optional(),
+  status: z.string().trim().toUpperCase().regex(/^[A-Z_]{2,30}$/).optional(),
+}).strict().refine(value => Object.keys(value).length > 0, 'No updatable fields provided');
+
+const PosApprovalSchema = z.object({
+  requestId: z.string().trim().min(1).max(128),
+  action: z.enum(['APPROVE', 'REJECT']),
+}).strict();
+
+const ExpirePendingSchema = z.object({
+  timeoutMinutes: z.number().int().min(5).max(24 * 60).optional(),
+}).strict();
+
+const PosRouteParamSchema = z.string().trim().min(1).max(128);
+function validPosRouteParam(value: unknown, name: string): string {
+  const parsed = PosRouteParamSchema.safeParse(value);
+  if (!parsed.success) throw ApiError.badRequest(`Invalid ${name}`);
+  return parsed.data;
+}
 function hashSessionToken(token: string): string {
   return crypto.createHash('sha256').update(token).digest('hex');
 }
@@ -241,7 +296,7 @@ router.post('/payment-notifications/:id/acknowledge', requirePosSession, async (
     const session = (req as any).posSession as { cashierId: string };
     const result = await db.paymentNotification.updateMany({
       where: {
-        id: req.params.id,
+        id: validPosRouteParam(req.params.id, 'identifier'),
         acknowledgedAt: null, // idempotent — already-acked notifications are a no-op
         posSale: { cashierId: session.cashierId },
       },
@@ -316,16 +371,10 @@ router.get('/hardware', async (req: Request, res: Response, next: NextFunction) 
 // Owner only: update hardware connection status flags.
 router.patch('/hardware', requireAdmin, requireRole('OWNER'), async (req: AuthRequest, res: Response, next: NextFunction) => {
   try {
-    const allowedFields = ['tabletName', 'tabletConnected', 'barcodeScanner', 'fingerprintReader', 'receiptPrinter', 'cashDrawer', 'status'] as const;
-    const update: Record<string, unknown> = {};
-    for (const field of allowedFields) {
-      if (req.body[field] !== undefined) update[field] = req.body[field];
-    }
-    if (Object.keys(update).length === 0) {
-      res.status(400).json({ success: false, error: { code: 'BAD_REQUEST', message: 'No updatable fields provided' } });
-      return;
-    }
-    const hw = await db.hardwareConfig.update({ where: { id: 'pos-01' }, data: update });
+    const parsed = HardwareUpdateSchema.safeParse(req.body);
+    if (!parsed.success) throw ApiError.badRequest('Invalid hardware update');
+
+    const hw = await db.hardwareConfig.update({ where: { id: 'pos-01' }, data: parsed.data });
     res.json({ success: true, hardware: hw });
   } catch (error) {
     next(error);
@@ -425,7 +474,7 @@ router.get('/auth-status/:requestId', async (req: Request, res: Response, next: 
     }
 
     const request = await db.posLoginRequest.findUnique({
-      where: { id: req.params.requestId },
+      where: { id: validPosRouteParam(req.params.requestId, 'authorization request identifier') },
       include: { cashier: { select: { name: true } } },
     });
 
@@ -535,11 +584,9 @@ router.get('/pending-approvals', requireAdmin, requireRole('OWNER'), async (_req
 // ── POST /api/pos/approve-request ─────────────────────────────────────────
 router.post('/approve-request', requireAdmin, requireRole('OWNER'), async (req: AuthRequest, res: Response, next: NextFunction) => {
   try {
-    const { requestId, action } = req.body as { requestId?: string; action?: 'APPROVE' | 'REJECT' };
-
-    if (!requestId || !['APPROVE', 'REJECT'].includes(action || '')) {
-      throw ApiError.badRequest('requestId and action (APPROVE or REJECT) are required');
-    }
+    const parsed = PosApprovalSchema.safeParse(req.body);
+    if (!parsed.success) throw ApiError.badRequest('requestId and action (APPROVE or REJECT) are required');
+    const { requestId, action } = parsed.data;
 
     const request = await db.posLoginRequest.findUnique({ where: { id: requestId } });
     if (!request) {
@@ -646,6 +693,8 @@ router.post('/checkout', requirePosSession, async (req: Request, res: Response, 
     if (!session.id || !session.cashierId || !session.cashierName) {
       throw ApiError.unauthorized('Invalid POS session — cannot create sale without session context');
     }
+    const parsed = PosCheckoutSchema.safeParse(req.body);
+    if (!parsed.success) throw ApiError.badRequest('Invalid POS checkout details');
     const {
       customerName,
       customerPhone,
@@ -654,21 +703,12 @@ router.post('/checkout', requirePosSession, async (req: Request, res: Response, 
       discountPercent,
       paymentMethod,
       cashReceived,
-      changeGiven,
       offlineReceiptId,
-    } = req.body;
-
-    if (!items || !Array.isArray(items) || items.length === 0) {
-      throw ApiError.badRequest('Cart cannot be empty for POS checkout', 'BAD_REQUEST');
-    }
+    } = parsed.data;
 
     const quantities = new Map<string, number>();
     for (const item of items) {
-      if (typeof item?.variantId !== 'string') throw ApiError.badRequest('Each cart item requires a variant');
-      const quantity = Number(item.quantity);
-      if (!Number.isInteger(quantity) || quantity < 1 || quantity > 20) {
-        throw ApiError.badRequest('Each cart quantity must be between 1 and 20');
-      }
+      const quantity = item.quantity;
       quantities.set(item.variantId, (quantities.get(item.variantId) || 0) + quantity);
     }
     if ([...quantities.values()].some(quantity => quantity > 20)) {
@@ -698,25 +738,12 @@ router.post('/checkout', requirePosSession, async (req: Request, res: Response, 
       };
     });
     const serverSubtotal = Number(lineItems.reduce((sum: number, item: any) => sum + item.price * item.quantity, 0).toFixed(2));
-    const safeDiscountPercent = Number(discountPercent) || 0;
-    if (!Number.isInteger(safeDiscountPercent) || safeDiscountPercent < 0 || safeDiscountPercent > 20) {
-      throw ApiError.badRequest('POS discount must be a whole number from 0 to 20');
-    }
+    const safeDiscountPercent = discountPercent;
     const serverDiscount = Number((serverSubtotal * safeDiscountPercent / 100).toFixed(2));
     const serverTotal = Number((serverSubtotal - serverDiscount).toFixed(2));
-    const finalPaymentMethod = paymentMethod as string;
-    if (!['CASH', 'MPESA'].includes(finalPaymentMethod)) {
-      // CARD is not yet integrated with a real card processor/terminal.
-      // Accepting it would record a PAID sale without authorization evidence.
-      // Reject all unknown payment methods rather than silently defaulting.
-      throw ApiError.badRequest(
-        finalPaymentMethod === 'CARD'
-          ? 'Card payment is not yet available on this terminal. Please use Cash or M-PESA.'
-          : 'Invalid payment method. Accepted: CASH, MPESA',
-        'BAD_REQUEST',
-      );
-    }
-    if (finalPaymentMethod === 'CASH' && Number(cashReceived) < serverTotal) {      throw ApiError.badRequest('Cash received is less than the sale total');
+    const finalPaymentMethod = paymentMethod;
+    if (finalPaymentMethod === 'CASH' && (cashReceived == null || cashReceived < serverTotal)) {
+      throw ApiError.badRequest('Cash received is less than the sale total');
     }
 
     const receiptNumber = offlineReceiptId || ('GCPOS' + crypto.randomBytes(3).toString('hex').toUpperCase());
@@ -771,8 +798,8 @@ router.post('/checkout', requirePosSession, async (req: Request, res: Response, 
           paymentExpiresAt: finalPaymentMethod === 'MPESA'
             ? new Date(Date.now() + 30 * 60 * 1000)
             : null,
-          cashReceived: finalPaymentMethod === 'CASH' ? Number(cashReceived) : null,
-          changeGiven: finalPaymentMethod === 'CASH' ? Math.max(0, Number(cashReceived) - serverTotal) : null,
+          cashReceived: finalPaymentMethod === 'CASH' ? cashReceived : null,
+          changeGiven: finalPaymentMethod === 'CASH' ? Math.max(0, cashReceived! - serverTotal) : null,
           customerPhone: normalizedPhone ?? null,
           // saleStatus starts OPEN — completed by cashier after payment confirmed
           saleStatus: 'OPEN',
@@ -958,7 +985,7 @@ router.post('/sales/:id/complete', requirePosSession, async (req: Request, res: 
   try {
     const session = (req as any).posSession as { id: string; cashierId: string; cashierName: string };
 
-    const sale = await db.posSale.findUnique({ where: { id: req.params.id } });
+    const sale = await db.posSale.findUnique({ where: { id: validPosRouteParam(req.params.id, 'sale identifier') } });
     if (!sale) throw ApiError.notFound('POS sale not found');
 
     // Cashier-scoped ownership: the same cashier may return after their POS
@@ -1002,7 +1029,9 @@ router.post('/sales/:id/complete', requirePosSession, async (req: Request, res: 
 // Uses paymentExpiresAt when set; falls back to timeoutMinutes from createdAt.
 router.post('/expire-pending', requireAdmin, requireRole('OWNER'), async (req: AuthRequest, res: Response, next: NextFunction) => {
   try {
-    const timeoutMinutes = Number(req.body?.timeoutMinutes ?? 30);
+    const parsed = ExpirePendingSchema.safeParse(req.body ?? {});
+    if (!parsed.success) throw ApiError.badRequest('Invalid pending-sale timeout');
+    const timeoutMinutes = parsed.data.timeoutMinutes ?? 30;
     const now = new Date();
     const fallbackCutoff = new Date(now.getTime() - timeoutMinutes * 60 * 1000);
 

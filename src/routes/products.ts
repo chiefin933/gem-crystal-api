@@ -8,48 +8,56 @@ import { z } from 'zod';
 const router = Router();
 
 const ProductKeySchema = z.string().trim().min(1).max(128);
+const PriceQuerySchema = z.string().trim().regex(/^\d{1,7}(?:\.\d{1,2})?$/, 'Invalid price filter').transform(Number);
+const ProductListQuerySchema = z.object({
+  gender: z.enum(['women', 'men', 'unisex', 'all']).optional(),
+  category: z.string().trim().min(1).max(80).optional(),
+  search: z.string().trim().max(100).optional(),
+  minPrice: PriceQuerySchema.optional(),
+  maxPrice: PriceQuerySchema.optional(),
+  onSale: z.enum(['true', 'false']).optional(),
+  inStock: z.enum(['true', 'false']).optional(),
+  sortBy: z.enum(['price-low', 'price-high', 'newest', 'bestselling', 'featured']).optional(),
+}).strict().refine(
+  value => value.minPrice === undefined || value.maxPrice === undefined || value.minPrice <= value.maxPrice,
+  { message: 'Minimum price cannot exceed maximum price' },
+);
 
 // Helper: parse JSON fields back to JS objects/arrays
-function parseProduct(p: any) {
+function parseProduct(product: any) {
   return {
-    ...p,
-    images: JSON.parse(p.images || '[]'),
-    sizes: JSON.parse(p.sizes || '[]'),
-    colors: JSON.parse(p.colors || '[]'),
+    ...product,
+    images: JSON.parse(product.images || '[]'),
+    sizes: JSON.parse(product.sizes || '[]'),
+    colors: JSON.parse(product.colors || '[]'),
   };
 }
-
 // ── GET /api/products ─────────────────────────────────────────────────────
 // Public endpoint: list products with optional filtering
 router.get('/', async (req: Request, res: Response) => {
   try {
-    const {
-      gender,
-      category,
-      search,
-      minPrice,
-      maxPrice,
-      onSale,
-      inStock,
-      sortBy,
-    } = req.query;
-
+    const parsed = ProductListQuerySchema.safeParse(req.query);
+    if (!parsed.success) {
+      res.status(400).json({ error: 'Invalid product filters' });
+      return;
+    }
+    const { gender, category, search, minPrice, maxPrice, onSale, inStock, sortBy } = parsed.data;
     const where: any = { isActive: true };
 
-    if (gender && gender !== 'all') where.gender = gender as string;
-    if (category && category !== 'All') where.category = category as string;
+    if (gender && gender !== 'all') where.gender = gender;
+    if (category && category !== 'All') where.category = category;
     if (onSale === 'true') where.onSale = true;
     if (search) {
       where.OR = [
-        { title: { contains: search as string } },
-        { category: { contains: search as string } },
-        { description: { contains: search as string } },
+        { title: { contains: search } },
+        { category: { contains: search } },
+        { description: { contains: search } },
       ];
     }
 
-    let priceWhere: any = {};
-    if (minPrice) priceWhere.gte = Number(minPrice);
-    if (maxPrice) priceWhere.lte = Number(maxPrice);
+    const priceWhere: any = {};
+    if (minPrice !== undefined) priceWhere.gte = minPrice;
+    if (maxPrice !== undefined) priceWhere.lte = maxPrice;
     if (Object.keys(priceWhere).length > 0) where.price = priceWhere;
 
     let orderBy: any = {};
@@ -67,11 +75,8 @@ router.get('/', async (req: Request, res: Response) => {
       include: { variants: true },
     });
 
-    // inStock filter: at least one variant has stockQuantity > 0
     if (inStock === 'true') {
-      products = products.filter(p =>
-        p.variants.some(v => v.stockQuantity > 0)
-      );
+      products = products.filter(product => product.variants.some(variant => variant.stockQuantity > 0));
     }
 
     res.json(products.map(parseProduct));
@@ -80,6 +85,7 @@ router.get('/', async (req: Request, res: Response) => {
     res.status(500).json({ error: 'Failed to fetch products' });
   }
 });
+
 
 // ── GET /api/products/:id ─────────────────────────────────────────────────
 router.get('/:id', async (req: Request, res: Response) => {

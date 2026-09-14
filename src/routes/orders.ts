@@ -32,6 +32,22 @@ function validRouteParam(value: unknown, name: string): string {
   if (!parsed.success) throw ApiError.badRequest(`Invalid ${name}`);
   return parsed.data;
 }
+const UnmatchedPaymentResolutionSchema = z.object({
+  action: z.enum(['ASSIGNED', 'IGNORED']),
+  note: z.string().trim().min(3).max(500).refine(
+    value => !/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/.test(value),
+    'Resolution note contains unsupported control characters',
+  ),
+  targetType: z.enum(['ORDER', 'POS_SALE']).optional(),
+  targetRef: z.string().trim().min(1).max(128).regex(/^[A-Za-z0-9_-]+$/).optional(),
+}).strict().superRefine((value, context) => {
+  if (value.action === 'ASSIGNED' && (!value.targetType || !value.targetRef)) {
+    context.addIssue({ code: z.ZodIssueCode.custom, message: 'Assigned payments require a target type and reference' });
+  }
+  if (value.action === 'IGNORED' && (value.targetType || value.targetRef)) {
+    context.addIssue({ code: z.ZodIssueCode.custom, message: 'Ignored payments cannot include a target' });
+  }
+});
 
 /**
  * toNum — safely converts a Prisma Decimal (or plain number) to a JS number.
@@ -677,21 +693,12 @@ router.post('/:id/payment-override', requireAdmin, requireRole('OWNER'), async (
 // Owner: mark an unmatched payment as IGNORED or manually ASSIGN to order/sale.
 router.post('/unmatched-payments/:id/resolve', requireAdmin, requireRole('OWNER'), async (req: AuthRequest, res: Response, next: NextFunction) => {
   try {
-    const { action, note, targetType, targetRef } = req.body as {
-      action: 'ASSIGNED' | 'IGNORED';
-      note: string;
-      targetType?: 'ORDER' | 'POS_SALE';
-      targetRef?: string;
-    };
+    const parsed = UnmatchedPaymentResolutionSchema.safeParse(req.body);
+    if (!parsed.success) throw ApiError.badRequest('Invalid unmatched payment resolution');
+    const { action, note, targetType, targetRef } = parsed.data;
+    const paymentId = validRouteParam(req.params.id, 'payment identifier');
 
-    if (!['ASSIGNED', 'IGNORED'].includes(action)) {
-      throw ApiError.badRequest('action must be ASSIGNED or IGNORED');
-    }
-    if (!note?.trim()) {
-      throw ApiError.badRequest('A resolution note is required');
-    }
-
-    const payment = await (prisma as any).unmatchedPayment.findUnique({ where: { id: req.params.id } });
+    const payment = await (prisma as any).unmatchedPayment.findUnique({ where: { id: paymentId } });
     if (!payment) throw ApiError.notFound('Unmatched payment not found');
     if (payment.status !== 'UNMATCHED') {
       throw ApiError.badRequest(`Payment is already ${payment.status}`);
@@ -701,7 +708,7 @@ router.post('/unmatched-payments/:id/resolve', requireAdmin, requireRole('OWNER'
     const paidAmount = toNum(payment.amount);
 
     await prisma.$transaction(async (tx) => {
-      if (action === 'ASSIGNED' && targetType && targetRef) {
+      if (action === 'ASSIGNED') {
         if (targetType === 'ORDER') {
           // Verify the order exists and is in a state that can be paid
           const order = await tx.order.findFirst({
@@ -766,7 +773,7 @@ router.post('/unmatched-payments/:id/resolve', requireAdmin, requireRole('OWNER'
       }
 
       await (tx as any).unmatchedPayment.update({
-        where: { id: req.params.id },
+        where: { id: paymentId },
         data: { status: action, resolvedAt: new Date(), resolvedBy: actor, resolutionNote: note.trim() },
       });
 
