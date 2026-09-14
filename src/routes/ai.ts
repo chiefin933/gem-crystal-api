@@ -260,17 +260,12 @@ async function executeTool(name: string, args: Record<string, any>): Promise<str
 
     case 'get_delivery_info': {
       const settings = await prisma.storeSettings.findUnique({ where: { id: 'default' } });
-      // Read from StoreSettings — the single source of truth shared with orders.ts
-      const DELIVERY_FEE        = settings?.deliveryFeeKes          ?? 350;
-      const FREE_THRESHOLD      = settings?.freeDeliveryThresholdKes ?? 10000;
       return JSON.stringify({
-        coverage: 'Kenya nationwide',
-        deliveryFee: DELIVERY_FEE,
-        freeDeliveryThreshold: FREE_THRESHOLD,
-        freeDeliveryNote: `Orders of KES ${FREE_THRESHOLD.toLocaleString()} and above qualify for free delivery`,
+        coverage: 'Kenya delivery can be arranged',
+        deliveryFeeIncluded: false,
         currency: 'KES',
-        disclaimer: settings?.deliveryFeeDisclaimer ?? 'Delivery fee is paid separately by the customer.',
-        note: 'Delivery times vary by location. Contact the shop for estimates.',
+        disclaimer: settings?.deliveryFeeDisclaimer ?? 'Delivery is arranged and paid separately between the customer and delivery person; it is not included in the product order total.',
+        note: 'Agree the delivery cost and timing directly with the delivery person. Contact the shop for delivery availability.',
       });
     }
 

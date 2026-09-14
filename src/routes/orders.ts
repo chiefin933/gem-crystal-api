@@ -247,9 +247,6 @@ router.post('/', async (req: Request, res: Response, next: NextFunction) => {
     let couponCode: string | null = null;
     let discount = 0;
 
-    const storeSettings = await prisma.storeSettings.findUnique({ where: { id: 'default' } });
-    const DELIVERY_FEE_KES        = storeSettings?.deliveryFeeKes          ?? 350;
-    const FREE_DELIVERY_THRESHOLD = storeSettings?.freeDeliveryThresholdKes ?? 10000;
 
     if (data.couponCode) {
       const coupon = await prisma.coupon.findUnique({ where: { code: data.couponCode } });
@@ -266,8 +263,10 @@ router.post('/', async (req: Request, res: Response, next: NextFunction) => {
       ));
     }
 
-    const deliveryFee = subtotal >= FREE_DELIVERY_THRESHOLD ? 0 : DELIVERY_FEE_KES;
-    const total = roundMoney(subtotal - discount + deliveryFee);
+    // Delivery is arranged and paid directly with the delivery person; it is never
+    // collected by this checkout or included in the M-PESA product payment.
+    const deliveryFee = 0;
+    const total = roundMoney(subtotal - discount);
 
     // ── Create CheckoutSession — payment intent with no stock side-effects ──
     const sessionRef = `GC-PAY-${Date.now().toString(36).toUpperCase()}-${crypto.randomBytes(3).toString('hex').toUpperCase()}`;
@@ -309,7 +308,7 @@ router.post('/', async (req: Request, res: Response, next: NextFunction) => {
       tillNumber,
       status: 'AWAITING_PAYMENT',
       message: tillNumber
-        ? `Pay KES ${total.toLocaleString()} to Till ${tillNumber} using reference ${sessionRef}. Your order will be confirmed automatically.`
+        ? `Pay KES ${total.toLocaleString()} to Till ${tillNumber} using reference ${sessionRef}. Delivery is arranged and paid separately with the delivery person. Your order will be confirmed automatically.`
         : 'Till number not configured. Contact the shop via WhatsApp.',
     });
   } catch (error) {
