@@ -238,10 +238,12 @@ router.get('/payment-notifications', requirePosSession, async (req: Request, res
 // will receive the notification again on the next poll.
 router.post('/payment-notifications/:id/acknowledge', requirePosSession, async (req: Request, res: Response, next: NextFunction) => {
   try {
+    const session = (req as any).posSession as { cashierId: string };
     const result = await db.paymentNotification.updateMany({
       where: {
         id: req.params.id,
         acknowledgedAt: null, // idempotent — already-acked notifications are a no-op
+        posSale: { cashierId: session.cashierId },
       },
       data: { acknowledgedAt: new Date() },
     });
