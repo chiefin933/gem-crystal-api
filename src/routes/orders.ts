@@ -488,7 +488,7 @@ router.post('/mpesa-callback', async (req: Request, res: Response, next: NextFun
       if (!['PENDING', 'PENDING_CORRELATION'].includes(payment.paymentStatus)) return { accepted: false, message: 'Payment cannot be accepted' };
 
       if (order) {
-        const paid = await tx.order.update({ where: { id: order.id }, data: { paymentStatus: 'PAID', mpesaReceipt: receipt.trim() } });
+        const paid = await tx.order.update({ where: { id: order.id }, data: { paymentStatus: 'PAID', paidAt: new Date(), mpesaReceipt: receipt.trim() } });
         await queueOrderPaymentNotification(tx, { ...paid, paymentReference: paid.orderNumber, actualPaymentAmount: paidAmount });
         // Capture event payload — emit AFTER transaction commits
         const evt = {
@@ -633,7 +633,7 @@ router.post('/:id/payment-override', requireAdmin, requireRole('OWNER'), async (
 
       const updated = await tx.order.update({
         where: { id },
-        data: { paymentStatus: targetStatus },
+        data: { paymentStatus: targetStatus, paidAt: targetStatus === 'PAID' ? new Date() : existing.paidAt },
       });
 
       // Restore stock when manually marking FAILED — consistent with
@@ -718,7 +718,7 @@ router.post('/unmatched-payments/:id/resolve', requireAdmin, requireRole('OWNER'
 
           await tx.order.update({
             where: { id: order.id },
-            data: { paymentStatus: 'PAID', mpesaReceipt: payment.mpesaReceipt },
+            data: { paymentStatus: 'PAID', paidAt: new Date(), mpesaReceipt: payment.mpesaReceipt },
           });
 
           await queueOrderPaymentNotification(tx, {
@@ -1019,7 +1019,7 @@ router.post('/c2b-callback', async (req: Request, res: Response, next: NextFunct
             subtotal: sess.subtotal, discount: sess.discount, couponCode: sess.couponCode,
             deliveryFee: sess.deliveryFee, total: sess.total, currency: sess.currency,
             orderedAt: sess.createdAt, requestedDeliveryDate: sess.requestedDeliveryDate,
-            paymentMethod: 'MPESA', paymentStatus: 'PAID', fulfillmentStatus: 'PENDING',
+            paymentMethod: 'MPESA', paymentStatus: 'PAID', paidAt: new Date(), fulfillmentStatus: 'PENDING',
             mpesaReceipt: receipt,
           },
         });
@@ -1039,7 +1039,7 @@ router.post('/c2b-callback', async (req: Request, res: Response, next: NextFunct
 
       // All checks passed — mark existing order/sale as PAID
       if (matchedOrder) {
-        const paid = await tx.order.update({ where: { id: matchedOrder.id }, data: { paymentStatus: 'PAID', mpesaReceipt: receipt } });
+        const paid = await tx.order.update({ where: { id: matchedOrder.id }, data: { paymentStatus: 'PAID', paidAt: new Date(), mpesaReceipt: receipt } });
         await queueOrderPaymentNotification(tx, { ...paid, paymentReference: paid.orderNumber });
       } else {
         const paid = await (tx as any).posSale.update({

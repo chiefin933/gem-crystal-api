@@ -65,6 +65,7 @@ model Order {
   deliveryFee            Decimal              @default(350) @db.Decimal(10, 2)
   total                  Decimal              @db.Decimal(10, 2)
   currency               String               @default("KES")
+  paidAt                 DateTime?
   paymentMethod          String
   paymentStatus          String               @default("PENDING")
   fulfillmentStatus      String               @default("PENDING")
@@ -81,6 +82,8 @@ model Order {
   // Payment expiry — if not paid by this time, stock reservation is released
   paymentExpiresAt       DateTime?
   paymentNotifications   PaymentNotification?
+
+  @@index([paymentStatus, paidAt])
 }
 
 model PaymentNotification {

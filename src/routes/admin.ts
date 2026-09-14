@@ -12,6 +12,95 @@ function toNum(v: { toNumber(): number } | number | null | undefined): number {
   return typeof v === 'object' ? v.toNumber() : Number(v);
 }
 
+/**
+ * The owner dashboard reports calendar-day sales in the boutique's local
+ * timezone, not the timezone of whichever server happens to run the API.
+ * Nairobi does not observe daylight saving time, but these helpers still use
+ * Intl so the configured timezone remains explicit and easy to change.
+ */
+const BUSINESS_TIME_ZONE = process.env.BUSINESS_TIME_ZONE || 'Africa/Nairobi';
+
+type BusinessDateParts = { year: number; month: number; day: number; hour: number; minute: number; second: number };
+
+function businessDateParts(date: Date): BusinessDateParts {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: BUSINESS_TIME_ZONE,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hourCycle: 'h23',
+  }).formatToParts(date);
+
+  const values = Object.fromEntries(
+    parts
+      .filter(part => part.type !== 'literal')
+      .map(part => [part.type, Number(part.value)]),
+  ) as Record<string, number>;
+
+  return {
+    year: values.year,
+    month: values.month,
+    day: values.day,
+    hour: values.hour,
+    minute: values.minute,
+    second: values.second,
+  };
+}
+
+function businessDayStart(now: Date, daysBefore = 0): Date {
+  const local = businessDateParts(now);
+  const calendarDate = new Date(Date.UTC(local.year, local.month - 1, local.day - daysBefore));
+
+  // Africa/Nairobi is UTC+03:00. Derive the offset via Intl so this remains
+  // correct when BUSINESS_TIME_ZONE is deliberately changed in configuration.
+  const midnightAsUtc = Date.UTC(
+    calendarDate.getUTCFullYear(),
+    calendarDate.getUTCMonth(),
+    calendarDate.getUTCDate(),
+  );
+  const offsetParts = businessDateParts(new Date(midnightAsUtc));
+  const offsetMs = Date.UTC(
+    offsetParts.year,
+    offsetParts.month - 1,
+    offsetParts.day,
+    offsetParts.hour,
+    offsetParts.minute,
+    offsetParts.second,
+  ) - midnightAsUtc;
+
+  return new Date(midnightAsUtc - offsetMs);
+}
+
+function businessDateKey(date: Date): string {
+  const local = businessDateParts(date);
+  return `${local.year}-${String(local.month).padStart(2, '0')}-${String(local.day).padStart(2, '0')}`;
+}
+
+type SalesPeriod = {
+  key: 'today' | 'yesterday' | 'last7Days' | 'last30Days';
+  label: string;
+  description: string;
+  startsAt: Date;
+  endsAt: Date;
+};
+
+function createSalesPeriods(now: Date): SalesPeriod[] {
+  const todayStart = businessDayStart(now);
+  // Use an exclusive end so a completed sale can never be counted twice at a
+  // midnight boundary. The current instant is advanced by 1ms to include it.
+  const nowExclusive = new Date(now.getTime() + 1);
+
+  return [
+    { key: 'today', label: 'Today', description: 'Since midnight', startsAt: todayStart, endsAt: nowExclusive },
+    { key: 'yesterday', label: 'Yesterday', description: 'Previous calendar day', startsAt: businessDayStart(now, 1), endsAt: todayStart },
+    { key: 'last7Days', label: 'Last 7 days', description: 'Rolling window, including today', startsAt: businessDayStart(now, 6), endsAt: nowExclusive },
+    { key: 'last30Days', label: 'Last 30 days', description: 'Rolling window, including today', startsAt: businessDayStart(now, 29), endsAt: nowExclusive },
+  ];
+}
+
 // ── Validation schema ─────────────────────────────────────────────────────
 const AdminLoginSchema = z.object({
   email: z
@@ -113,6 +202,8 @@ router.get('/me', requireAdmin, async (req: AuthRequest, res: Response) => {
 // Dashboard KPI stats — covers the ENTIRE boutique (ecommerce + POS)
 router.get('/stats', requireAdmin, requireRole('OWNER'), async (_req: AuthRequest, res: Response) => {
   try {
+    const completedPosSaleWhere = { saleStatus: 'COMPLETED', paymentStatus: 'PAID' };
+
     const [
       totalProducts,
       totalOrders,
@@ -141,9 +232,9 @@ router.get('/stats', requireAdmin, requireRole('OWNER'), async (_req: AuthReques
       prisma.coupon.count({ where: { isActive: true } }),
       // POS paid sales — use saleStatus=COMPLETED so revenue reflects
       // only fully finalized sales, not just payment confirmations
-      (prisma as any).posSale.findMany({ where: { saleStatus: 'COMPLETED' }, select: { total: true } }),
-      (prisma as any).posSale.aggregate({ where: { paymentMethod: 'MPESA', saleStatus: 'COMPLETED' }, _sum: { total: true } }),
-      (prisma as any).posSale.aggregate({ where: { paymentMethod: 'CASH', saleStatus: 'COMPLETED' }, _sum: { total: true } }),
+      (prisma as any).posSale.findMany({ where: completedPosSaleWhere, select: { total: true } }),
+      (prisma as any).posSale.aggregate({ where: { ...completedPosSaleWhere, paymentMethod: 'MPESA' }, _sum: { total: true } }),
+      (prisma as any).posSale.aggregate({ where: { ...completedPosSaleWhere, paymentMethod: 'CASH' }, _sum: { total: true } }),
       // Ecommerce by method
       prisma.order.aggregate({ where: { paymentMethod: 'MPESA', paymentStatus: 'PAID' }, _sum: { total: true } }),
       prisma.order.aggregate({ where: { paymentMethod: 'CARD', paymentStatus: 'PAID' }, _sum: { total: true } }),
@@ -165,46 +256,77 @@ router.get('/stats', requireAdmin, requireRole('OWNER'), async (_req: AuthReques
     const posMpesa: number  = toNum(posMpesaAgg._sum.total);
     const posCash:  number  = toNum(posCashAgg._sum.total);
 
+    // ── Owner sales periods — database-calculated, never browser-derived ───
+    const statsGeneratedAt = new Date();
+    const salesPeriods = await Promise.all(
+      createSalesPeriods(statsGeneratedAt).map(async period => {
+        const [website, pos] = await Promise.all([
+          prisma.order.aggregate({
+            where: { paymentStatus: 'PAID', paidAt: { gte: period.startsAt, lt: period.endsAt } },
+            _sum: { total: true },
+            _count: true,
+          }),
+          (prisma as any).posSale.aggregate({
+            where: { ...completedPosSaleWhere, completedAt: { gte: period.startsAt, lt: period.endsAt } },
+            _sum: { total: true },
+            _count: true,
+          }),
+        ]);
+
+        return {
+          key: period.key,
+          label: period.label,
+          description: period.description,
+          revenue: Math.round(toNum(website._sum.total) + toNum(pos._sum.total)),
+          transactions: website._count + pos._count,
+        };
+      }),
+    );
+
     // ── Sales by day — last 14 days ───────────────────────────────────────
-    const fourteenDaysAgo = new Date(Date.now() - 14 * 24 * 60 * 60 * 1000);
+    const fourteenDaysAgo = businessDayStart(statsGeneratedAt, 13);
 
     const [recentOrders, recentPosSales] = await Promise.all([
       prisma.order.findMany({
-        where: { paymentStatus: 'PAID', createdAt: { gte: fourteenDaysAgo } },
-        select: { createdAt: true, total: true },
+        where: { paymentStatus: 'PAID', paidAt: { gte: fourteenDaysAgo } },
+        select: { paidAt: true, total: true },
       }),
       (prisma as any).posSale.findMany({
-        where: { saleStatus: 'COMPLETED', createdAt: { gte: fourteenDaysAgo } },
-        select: { createdAt: true, total: true },
+        where: { ...completedPosSaleWhere, completedAt: { gte: fourteenDaysAgo } },
+        select: { completedAt: true, total: true },
       }),
     ]);
 
     // Build date→revenue map for the last 14 days
     const dayMap = new Map<string, number>();
     for (let i = 13; i >= 0; i--) {
-      const d = new Date(Date.now() - i * 24 * 60 * 60 * 1000);
-      dayMap.set(d.toISOString().slice(0, 10), 0);
+      const d = businessDayStart(statsGeneratedAt, i);
+      dayMap.set(businessDateKey(d), 0);
     }
     for (const o of recentOrders) {
-      const key = new Date(o.createdAt).toISOString().slice(0, 10);
-      if (dayMap.has(key)) dayMap.set(key, (dayMap.get(key) ?? 0) + toNum(o.total));
+      if (o.paidAt) {
+        const key = businessDateKey(o.paidAt);
+        if (dayMap.has(key)) dayMap.set(key, (dayMap.get(key) ?? 0) + toNum(o.total));
+      }
     }
     for (const s of recentPosSales) {
-      const key = new Date(s.createdAt).toISOString().slice(0, 10);
-      if (dayMap.has(key)) dayMap.set(key, (dayMap.get(key) ?? 0) + toNum(s.total));
+      if (s.completedAt) {
+        const key = businessDateKey(s.completedAt);
+        if (dayMap.has(key)) dayMap.set(key, (dayMap.get(key) ?? 0) + toNum(s.total));
+      }
     }
     const salesByDay = [...dayMap.entries()].map(([date, revenue]) => ({ date, revenue: Math.round(revenue) }));
 
     // ── Top products by units sold (last 30 days) ─────────────────────────
-    const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+    const thirtyDaysAgo = businessDayStart(statsGeneratedAt, 29);
 
     const [ordersForRanking, posForRanking] = await Promise.all([
       prisma.order.findMany({
-        where: { paymentStatus: 'PAID', createdAt: { gte: thirtyDaysAgo } },
+        where: { paymentStatus: 'PAID', paidAt: { gte: thirtyDaysAgo } },
         select: { items: true },
       }),
       (prisma as any).posSale.findMany({
-        where: { saleStatus: 'COMPLETED', createdAt: { gte: thirtyDaysAgo } },
+        where: { ...completedPosSaleWhere, completedAt: { gte: thirtyDaysAgo } },
         select: { items: true },
       }),
     ]);
@@ -233,6 +355,11 @@ router.get('/stats', requireAdmin, requireRole('OWNER'), async (_req: AuthReques
       mpesaRevenue: ecomMpesa + posMpesa, cashRevenue: posCash, cardRevenue: ecomCard,
       ecomMpesaRevenue: ecomMpesa, posMpesaRevenue: posMpesa, posCashRevenue: posCash,
       // Analytics
+      salesPeriods: {
+        timeZone: BUSINESS_TIME_ZONE,
+        generatedAt: statsGeneratedAt.toISOString(),
+        periods: salesPeriods,
+      },
       salesByDay,
       topProducts,
       slowProducts,
