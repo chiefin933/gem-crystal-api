@@ -24,6 +24,8 @@ It is **not ready for an unattended public launch** until the high-priority iden
 
 ### SEC-002 — POS bearer token is persisted in browser local storage
 
+**Correction after tracing the live POS entry point:** the active terminal (`src/components/pos/PosTerminal.tsx`) keeps its cashier session only in React memory. The cited local-storage code belongs to an unused legacy dashboard path, so it is not an active terminal exposure; it should still be removed before launch to prevent accidental reuse. The active POS now auto-locks after ten minutes of user inactivity (POS commit `229e39a`).
+
 - Rule ID: REACT-AUTH-001 / JS-STORAGE-001
 - Severity: High
 - Location: `../gem-crystal-pos/src/context/AuthContext.tsx:21-54`; `../gem-crystal-pos/src/api/adminApi.ts:4-6`
