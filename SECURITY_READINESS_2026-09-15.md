@@ -22,16 +22,16 @@ It is **not ready for an unattended public launch** until the high-priority iden
 - Fix: add a server-side token-version (or session) field to the owner identity; include it in issued JWTs; reject mismatches; increment it at logout and when the owner forces sign-out. This is the first focused code fix.
 - Mitigation: use a separate owner device and change the owner password immediately if a device is lost until the fix is deployed.
 
-### SEC-002 — POS bearer token is persisted in browser local storage
+### SEC-002 — Retired POS dashboard code retains a persistent-token pattern
 
 **Correction after tracing the live POS entry point:** the active terminal (`src/components/pos/PosTerminal.tsx`) keeps its cashier session only in React memory. The cited local-storage code belongs to an unused legacy dashboard path, so it is not an active terminal exposure; it should still be removed before launch to prevent accidental reuse. The active POS now auto-locks after ten minutes of user inactivity (POS commit `229e39a`).
 
 - Rule ID: REACT-AUTH-001 / JS-STORAGE-001
-- Severity: High
-- Location: `../gem-crystal-pos/src/context/AuthContext.tsx:21-54`; `../gem-crystal-pos/src/api/adminApi.ts:4-6`
-- Evidence: `gc_admin_token` is persisted in `localStorage` and reused after browser restart.
-- Impact: any JavaScript execution on the POS origin, or physical access to an unlocked terminal profile, can reuse the token until its server expiry.
-- Fix: launch the POS on a dedicated managed tablet/PWA, set a short inactivity lock, and move sensitive identity state away from persistent browser storage. The robust version uses server-managed, HttpOnly sessions with CSRF protection; it must be introduced with a dedicated POS sign-in/lock-screen test so cashiers are not interrupted mid-sale.
+- Severity: Low
+- Location: `../gem-crystal-pos/src/context/AuthContext.tsx:21-54`; unused by the live `src/App.tsx` POS entry point.
+- Evidence: the retired path persists `gc_admin_token` in `localStorage`; the active terminal does not import it.
+- Impact: it becomes a token-theft risk if the retired code is accidentally mounted or copied into the live terminal.
+- Fix: remove the retired dashboard auth path before launch. The live terminal keeps its session in memory and now auto-locks after ten inactive minutes; a server-managed HttpOnly-session design remains the stronger long-term option.
 - Mitigation: use a separate browser/device profile for POS, OS screen lock, individual cashier accounts, and a short POS session policy.
 
 ### SEC-003 — MFA and emergency owner-device revocation are not implemented
