@@ -193,6 +193,9 @@ model Admin {
   name             String
   role             String            @default("OWNER")
   pinCode          String            @default("")
+  // Incremented whenever the owner signs out or forces a security reset.
+  // JWTs carry this value so a copied bearer token can be rejected immediately.
+  tokenVersion     Int               @default(0)
   createdAt        DateTime          @default(now())
   posLoginRequests PosLoginRequest[]
 }

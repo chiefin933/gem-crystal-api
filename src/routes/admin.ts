@@ -154,7 +154,7 @@ router.post('/login', async (req: Request, res: Response) => {
       return;
     }
 
-    const token = generateToken(admin.id, admin.email, admin.role as 'OWNER' | 'CASHIER');
+    const token = generateToken(admin.id, admin.email, admin.role as 'OWNER' | 'CASHIER', admin.tokenVersion);
 
     // Return token and admin at the top level so both the Admin and POS
     // frontends can read res.token / res.admin directly without unwrapping
@@ -174,14 +174,25 @@ router.post('/login', async (req: Request, res: Response) => {
 });
 
 // ── POST /api/admin/logout ────────────────────────────────────────────────
-// Stateless JWT logout — instructs the client to discard its token.
-// For full server-side revocation, a token blocklist/version field
-// would be added to the Admin model (Phase 5 hardening).
-router.post('/logout', requireAdmin, (_req: AuthRequest, res: Response) => {
-  res.json({
-    success: true,
-    data: { message: 'Logged out successfully. Please discard your token.' },
-  });
+// Increment the server-side token version before telling the browser to discard
+// its token. This invalidates every outstanding JWT for this owner immediately,
+// including a token copied from a lost or compromised device.
+router.post('/logout', requireAdmin, async (req: AuthRequest, res: Response) => {
+  try {
+    await prisma.admin.update({
+      where: { id: req.adminId },
+      data: { tokenVersion: { increment: 1 } },
+    });
+    res.json({
+      success: true,
+      data: { message: 'Logged out successfully.' },
+    });
+  } catch {
+    res.status(500).json({
+      success: false,
+      error: { code: 'INTERNAL_SERVER_ERROR', message: 'Logout failed' },
+    });
+  }
 });
 
 // ── GET /api/admin/me ─────────────────────────────────────────────────────

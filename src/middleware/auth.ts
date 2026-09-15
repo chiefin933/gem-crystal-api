@@ -27,6 +27,7 @@ interface JwtPayload {
   adminId: string;
   email: string;
   role: AdminRole;
+  tokenVersion: number;
 }
 
 export async function requireAdmin(req: AuthRequest, res: Response, next: NextFunction): Promise<void> {
@@ -52,10 +53,16 @@ export async function requireAdmin(req: AuthRequest, res: Response, next: NextFu
 
     const admin = await prisma.admin.findUnique({
       where: { id: decoded.adminId },
-      select: { id: true, email: true, role: true },
+      select: { id: true, email: true, role: true, tokenVersion: true },
     });
 
-    if (!admin || admin.email !== decoded.email || !['OWNER', 'CASHIER'].includes(admin.role)) {
+    if (
+      !admin ||
+      admin.email !== decoded.email ||
+      !['OWNER', 'CASHIER'].includes(admin.role) ||
+      !Number.isInteger(decoded.tokenVersion) ||
+      decoded.tokenVersion !== admin.tokenVersion
+    ) {
       res.status(401).json({ success: false, error: { code: 'UNAUTHORIZED', message: 'Invalid authentication token' } });
       return;
     }
@@ -82,8 +89,8 @@ export function requireRole(...allowedRoles: AdminRole[]) {
   };
 }
 
-export function generateToken(adminId: string, email: string, role: AdminRole): string {
-  return jwt.sign({ adminId, email, role }, JWT_SECRET, {
+export function generateToken(adminId: string, email: string, role: AdminRole, tokenVersion: number): string {
+  return jwt.sign({ adminId, email, role, tokenVersion }, JWT_SECRET, {
     expiresIn: '12h',
     issuer: JWT_ISSUER,
     audience: JWT_AUDIENCE,
