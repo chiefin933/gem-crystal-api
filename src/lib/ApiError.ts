@@ -15,6 +15,7 @@ export type ErrorCode =
   | 'MEDIA_UPLOAD_FAILED'
   | 'HARDWARE_DISCONNECTED'
   | 'AUTH_EXPIRED'
+  | 'OFFLINE_REVIEW_REQUIRED'
   | 'INTERNAL_SERVER_ERROR';
 
 export class ApiError extends Error {

@@ -162,6 +162,9 @@ const PosCheckoutSchema = z.object({
   paymentMethod: z.enum(['CASH', 'MPESA']),
   cashReceived: MoneySchema.nullable().optional(),
   offlineReceiptId: z.string().trim().max(128).regex(/^GCPOS[A-Z0-9_-]{1,120}$/).optional(),
+  // Sent only when a cash sale is replayed from the POS local queue.
+  // The server recomputes the total from its current catalogue before accepting it.
+  offlineExpectedTotal: MoneySchema.optional(),
 }).strict();
 
 const HardwareUpdateSchema = z.object({
@@ -704,6 +707,7 @@ router.post('/checkout', requirePosSession, async (req: Request, res: Response, 
       paymentMethod,
       cashReceived,
       offlineReceiptId,
+      offlineExpectedTotal,
     } = parsed.data;
 
     const quantities = new Map<string, number>();
@@ -742,6 +746,12 @@ router.post('/checkout', requirePosSession, async (req: Request, res: Response, 
     const serverDiscount = Number((serverSubtotal * safeDiscountPercent / 100).toFixed(2));
     const serverTotal = Number((serverSubtotal - serverDiscount).toFixed(2));
     const finalPaymentMethod = paymentMethod;
+    if (offlineReceiptId && (finalPaymentMethod !== 'CASH' || cashReceived == null || offlineExpectedTotal == null)) {
+      throw ApiError.badRequest('Offline queueing is available only for cash sales with an expected total');
+    }
+    if (offlineExpectedTotal != null && Math.abs(offlineExpectedTotal - serverTotal) > 0.001) {
+      throw new ApiError(409, 'OFFLINE_REVIEW_REQUIRED', 'Offline sale total no longer matches current pricing. Owner review is required.');
+    }
     if (finalPaymentMethod === 'CASH' && (cashReceived == null || cashReceived < serverTotal)) {
       throw ApiError.badRequest('Cash received is less than the sale total');
     }
