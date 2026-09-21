@@ -4,6 +4,7 @@ import helmet from 'helmet';
 import compression from 'compression';
 import rateLimit from 'express-rate-limit';
 import dotenv from 'dotenv';
+import { callbackDiagnostics } from './middleware/callbackDiagnostics';
 import { prisma } from './lib/prisma';
 
 import productsRouter from './routes/products';
@@ -20,6 +21,7 @@ dotenv.config();
 const app = express();
 const PORT = Number(process.env.PORT) || 4000;
 app.disable('x-powered-by');
+app.use(callbackDiagnostics);
 
 // Trust exactly one proxy hop (Render, Nginx, etc.) so express-rate-limit
 // reads the real client IP from X-Forwarded-For rather than the proxy IP.

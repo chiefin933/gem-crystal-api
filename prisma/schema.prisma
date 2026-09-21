@@ -132,6 +132,7 @@ model UnmatchedPayment {
 // the C2B callback transaction — never before payment confirmation.
 model CheckoutSession {
   id              String    @id @default(cuid())
+  trackingTokenHash String?
   sessionRef      String    @unique  // customer-facing reference e.g. GC-PAY-XXXXX
   customerName    String
   customerEmail   String    @default("")
@@ -248,6 +249,9 @@ model PosSession {
 model PosSale {
   id                     String               @id @default(cuid())
   receiptNumber          String               @unique
+  // Stable browser-generated key. A retried checkout must resolve to this
+  // same sale instead of creating a second receipt or stock movement.
+  checkoutIdempotencyKey String               @unique
   // Session linkage — ties every sale to the exact cashier session that created it
   cashierId              String?
   cashierName            String

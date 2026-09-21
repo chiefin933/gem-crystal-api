@@ -13,3 +13,8 @@ npm-debug.log*
 .DS_Store
 coverage/
 .nyc_output/
+
+# Database backups contain private business/customer data.
+backups/
+*.dump
+*.dump.*

@@ -1,0 +1,6 @@
+[Unit]
+Description=Notify about a failed Gem and Crystal backup
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/notify-send --urgency=critical "Gem and Crystal backup failed" "Run npm run db:backup:status in gem-crystal-api and inspect the backup service log. Your previous backups have been retained."

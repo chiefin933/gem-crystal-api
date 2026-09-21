@@ -24,11 +24,9 @@
  *   TransactionType, TransID, TransTime, TransAmount,
  *   BusinessShortCode, BillRefNumber, MSISDN, FirstName, ...
  *
- * We correlate the payment to a pending sale using:
- *   1. BillRefNumber (receipt number the cashier/order tells the customer)
- *   2. Amount match (within tolerance)
- *   3. Phone match where available
- *   4. If no safe match → UnmatchedPayment for owner review
+ * Exact provider references can match an open checkout or sale. A reference-free
+ * Buy Goods payment is retained for owner reconciliation; amount alone is not identity.
+ * Amounts must match exactly in cents. A receipt can be consumed only once.
  */
 
 import crypto from 'crypto';

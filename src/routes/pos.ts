@@ -22,15 +22,19 @@ async function completeSaleAtomically(db: any, sale: any, session: { cashierName
   const result = await db.$transaction(async (tx: any) => {
     // Guard: only complete if still OPEN
     const updated = await tx.posSale.updateMany({
-      where: { id: sale.id, saleStatus: 'OPEN' },
+      where: { id: sale.id, saleStatus: 'OPEN', paymentStatus: 'PAID' },
       data: { saleStatus: 'COMPLETED', completedAt: new Date() },
     });
-    if (updated.count !== 1) return tx.posSale.findUnique({ where: { id: sale.id } });
+    if (updated.count !== 1) {
+      const current = await tx.posSale.findUnique({ where: { id: sale.id } });
+      if (current?.saleStatus === 'COMPLETED' && current.paymentStatus === 'PAID') return current;
+      throw ApiError.badRequest('Sale state changed. Refresh before completing payment.');
+    }
 
     const lineItems = JSON.parse(sale.items) as Array<{
       variantId: string; title: string; size: string; color: string; quantity: number;
     }>;
-    for (const item of lineItems) {
+    for (const item of [...lineItems].sort((a, b) => a.variantId.localeCompare(b.variantId))) {
       const rows = await tx.$queryRaw<Array<{ stockQuantity: number }>>`
         UPDATE "Variant" SET "stockQuantity" = "stockQuantity" - ${item.quantity}
         WHERE "id" = ${item.variantId} AND "stockQuantity" >= ${item.quantity}
@@ -151,6 +155,10 @@ const ReceiptReferenceSchema = z.string().trim().min(3).max(100).regex(
   'Receipt reference must use letters, numbers, hyphens, or underscores only',
 );
 const PosCheckoutSchema = z.object({
+  idempotencyKey: z.string().trim().min(16).max(128).regex(
+    /^[A-Za-z0-9_-]+$/,
+    'Checkout idempotency key contains unsupported characters',
+  ),
   customerName: PlainCustomerNameSchema.optional(),
   customerPhone: z.string().trim().regex(/^\+?[0-9]{9,15}$/, 'Enter a valid phone number').nullable().optional(),
   mpesaReceipt: ReceiptReferenceSchema.optional(),
@@ -301,7 +309,7 @@ router.post('/payment-notifications/:id/acknowledge', requirePosSession, async (
       where: {
         id: validPosRouteParam(req.params.id, 'identifier'),
         acknowledgedAt: null, // idempotent — already-acked notifications are a no-op
-        posSale: { cashierId: session.cashierId },
+        posSale: { cashierId: session.cashierId, saleStatus: 'COMPLETED', paymentStatus: 'PAID' },
       },
       data: { acknowledgedAt: new Date() },
     });
@@ -708,6 +716,7 @@ router.post('/checkout', requirePosSession, async (req: Request, res: Response, 
       cashReceived,
       offlineReceiptId,
       offlineExpectedTotal,
+      idempotencyKey,
     } = parsed.data;
 
     const quantities = new Map<string, number>();
@@ -763,19 +772,28 @@ router.post('/checkout', requirePosSession, async (req: Request, res: Response, 
       throw ApiError.badRequest('M-PESA Till payments are not configured. Check the Till number and C2B callback settings.');
     }
 
-    const existingSale = await db.posSale.findUnique({ where: { receiptNumber } });
+    const existingSale = await db.posSale.findUnique({ where: { checkoutIdempotencyKey: idempotencyKey } });
     if (existingSale) {
+      if (existingSale.cashierId !== session.cashierId) throw ApiError.forbidden('This receipt belongs to another cashier');
+      const recovered = existingSale.paymentMethod === 'CASH' && existingSale.saleStatus === 'OPEN'
+        ? await completeSaleAtomically(db, existingSale, session, req.ip ?? '') : existingSale;
       res.status(200).json({
         success: true,
         receiptNumber: existingSale.receiptNumber,
-        sale: { ...existingSale, items: JSON.parse(existingSale.items) },
+        sale: { ...recovered, items: JSON.parse(recovered.items) },
         idempotent: true,
         signals: { cashDrawerKickout: false, receiptPrinterTrigger: false },
       });
       return;
     }
 
-    const sale = await db.$transaction(async (tx: any) => {
+    const checkoutResult = await db.$transaction(async (tx: any) => {
+      // A transaction-scoped advisory lock closes the race between two
+      // identical retries that arrive before either can create its sale.
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${idempotencyKey}))`;
+      const replay = await tx.posSale.findUnique({ where: { checkoutIdempotencyKey: idempotencyKey } });
+      if (replay) return { sale: replay, idempotent: true };
+
       // Stock availability check — warn cashier now but do NOT deduct yet.
       // Stock is deducted atomically inside POST /sales/:id/complete after
       // payment is confirmed. This satisfies the payment-first invariant.
@@ -792,6 +810,7 @@ router.post('/checkout', requirePosSession, async (req: Request, res: Response, 
       const createdSale = await tx.posSale.create({
         data: {
           receiptNumber,
+          checkoutIdempotencyKey: idempotencyKey,
           cashierId: session.cashierId,
           cashierName: session.cashierName,
           sessionId: session.id,
@@ -845,8 +864,21 @@ router.post('/checkout', requirePosSession, async (req: Request, res: Response, 
         },
       });
 
-      return createdSale;
+      return { sale: createdSale, idempotent: false };
     });
+    const sale = checkoutResult.sale;
+    if (checkoutResult.idempotent) {
+      const recovered = sale.paymentMethod === 'CASH' && sale.saleStatus === 'OPEN'
+        ? await completeSaleAtomically(db, sale, session, req.ip ?? '') : sale;
+      res.status(200).json({
+        success: true,
+        receiptNumber: sale.receiptNumber,
+        sale: { ...recovered, items: JSON.parse(recovered.items) },
+        idempotent: true,
+        signals: { cashDrawerKickout: false, receiptPrinterTrigger: false },
+      });
+      return;
+    }
 
     // For CASH: complete the sale immediately since payment is in hand.
     // This deducts stock atomically and finalises the sale in one step.
@@ -1061,10 +1093,12 @@ router.post('/expire-pending', requireAdmin, requireRole('OWNER'), async (req: A
     let expiredSales = 0;
     for (const sale of pendingSales) {
       await db.$transaction(async (tx: any) => {
-        await tx.posSale.update({
-          where: { id: sale.id },
+        const expired = await tx.posSale.updateMany({
+          where: { id: sale.id, saleStatus: 'OPEN', paymentStatus: { in: ['PENDING', 'PENDING_CORRELATION'] }, ...expiredCondition },
           data: { paymentStatus: 'FAILED', saleStatus: 'EXPIRED' },
         });
+        if (expired.count !== 1) return;
+        expiredSales++;
         await releaseFailedPosSaleReservation(
           tx, sale,
           `Auto-expired: receipt #${sale.receiptNumber}`,
@@ -1077,7 +1111,6 @@ router.post('/expire-pending', requireAdmin, requireRole('OWNER'), async (req: A
           },
         });
       });
-      expiredSales++;
     }
 
     // ── Expire ecommerce orders ───────────────────────────────────────────
@@ -1091,10 +1124,12 @@ router.post('/expire-pending', requireAdmin, requireRole('OWNER'), async (req: A
     let expiredOrders = 0;
     for (const order of pendingOrders) {
       await prisma.$transaction(async (tx) => {
-        await tx.order.update({
-          where: { id: order.id },
+        const expired = await tx.order.updateMany({
+          where: { id: order.id, paymentStatus: { in: ['PENDING', 'PENDING_CORRELATION'] }, ...expiredCondition },
           data: { paymentStatus: 'FAILED' },
         });
+        if (expired.count !== 1) return;
+        expiredOrders++;
         await releaseFailedOrderReservation(tx, order, `Auto-expired: order #${order.orderNumber}`);
         await tx.auditLog.create({
           data: {
@@ -1105,7 +1140,6 @@ router.post('/expire-pending', requireAdmin, requireRole('OWNER'), async (req: A
           },
         });
       });
-      expiredOrders++;
     }
 
     res.json({

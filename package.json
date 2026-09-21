@@ -1,7 +1,7 @@
 {
   "name": "gem-crystal-api",
   "version": "1.0.0",
-  "description": "Gem & Crystal Fashion Hub — REST API Backend",
+  "description": "Gem & Crystal Fashion Hub \u2014 REST API Backend",
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "build": "tsc",
@@ -10,7 +10,15 @@
     "db:seed:demo": "NODE_ENV=development tsx prisma/seed-demo.ts",
     "db:migrate:deploy": "prisma migrate deploy",
     "db:migrate:dev": "prisma migrate dev",
-    "setup:dev": "prisma migrate deploy && NODE_ENV=development tsx prisma/seed.ts"
+    "setup:dev": "prisma migrate deploy && NODE_ENV=development tsx prisma/seed.ts",
+    "test": "node --import tsx --test tests/aiChat.test.ts",
+    "test:integration": "node --import tsx --test tests/payments.integration.test.ts",
+    "db:backup": "node scripts/database-backup.mjs backup",
+    "db:backup:verify": "node scripts/database-backup.mjs verify",
+    "test:backup": "node --test tests/database-backup.test.mjs",
+    "db:recovery:start": "node scripts/recovery-server.mjs start",
+    "db:recovery:stop": "node scripts/recovery-server.mjs stop",
+    "db:backup:status": "node scripts/database-backup.mjs status"
   },
   "dependencies": {
     "@prisma/client": "^5.16.0",

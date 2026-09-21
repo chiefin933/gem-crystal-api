@@ -39,6 +39,8 @@ import OpenAI from 'openai';
 import { prisma } from '../lib/prisma';
 import { z } from 'zod';
 
+import { aiConfig, ChatRequestSchema, runShoppingAssistant } from '../services/aiChat';
+
 const router = Router();
 
 // ── Provider configuration ─────────────────────────────────────────────────
@@ -52,7 +54,7 @@ function getClient(): OpenAI {
     if (!apiKey) {
       throw new Error('AI_API_KEY is not set. Add it to .env and restart the server.');
     }
-    const provider = (process.env.AI_PROVIDER ?? 'openrouter').toLowerCase();
+    const { provider } = aiConfig();
     const baseURL =
       provider === 'openai'
         ? 'https://api.openai.com/v1'
@@ -61,6 +63,8 @@ function getClient(): OpenAI {
     _client = new OpenAI({
       apiKey,
       baseURL,
+      timeout: 15_000,
+      maxRetries: 0,
       defaultHeaders:
         provider !== 'openai'
           ? {
@@ -73,20 +77,6 @@ function getClient(): OpenAI {
   }
   return _client;
 }
-
-const MODEL = process.env.AI_MODEL ?? 'minimax/minimax-m3:free';
-const MAX_TOKENS = Math.min(Number(process.env.AI_MAX_TOKENS ?? 500), 1000);
-
-// ── Request schema ────────────────────────────────────────────────────────
-const MessageSchema = z.object({
-  role: z.enum(['user', 'assistant']),
-  content: z.string().min(1).max(500),
-});
-
-const ChatRequestSchema = z.object({
-  message: z.string().min(1, 'Message is required').max(500, 'Message too long (max 500 chars)'),
-  history: z.array(MessageSchema).max(20).default([]),
-});
 
 // ── Tool definitions (read-only, customer-safe) ───────────────────────────
 const TOOLS: OpenAI.Chat.ChatCompletionTool[] = [
@@ -168,6 +158,13 @@ const TOOLS: OpenAI.Chat.ChatCompletionTool[] = [
 // Stock is expressed as a signal (IN_STOCK / LOW_STOCK / OUT_OF_STOCK) not
 // an exact count, to avoid exposing operational inventory data to the public.
 async function executeTool(name: string, args: Record<string, any>): Promise<string> {
+  const schemas: Record<string, z.ZodTypeAny> = {
+    search_products: z.object({ query: z.string().max(200).optional(), gender: z.enum(['women', 'men', 'unisex', 'all']).optional(), category: z.string().max(100).optional(), onSale: z.boolean().optional(), maxPrice: z.number().finite().nonnegative().optional() }).strict(),
+    get_product: z.object({ productId: z.string().min(1).max(128) }).strict(),
+    get_store_info: z.object({}).strict(), get_delivery_info: z.object({}).strict(),
+  };
+  if (!schemas[name]) throw new Error('Unknown tool');
+  args = schemas[name].parse(args);
   switch (name) {
     case 'search_products': {
       const where: any = { isActive: true };
@@ -345,7 +342,8 @@ router.post('/chat', async (req: Request, res: Response) => {
       return;
     }
   } catch {
-    // Non-fatal — proceed even if settings read fails
+    res.status(503).json({ success: false, error: { code: 'AI_UNAVAILABLE', message: 'The assistant is temporarily unavailable. Please contact us on WhatsApp.' } });
+    return;
   }
 
   // 3. Check API key is configured
@@ -360,80 +358,8 @@ router.post('/chat', async (req: Request, res: Response) => {
     return;
   }
 
-  const { message, history } = parsed.data;
-
-  // 4. Build message array for the chat completion
-  const messages: OpenAI.Chat.ChatCompletionMessageParam[] = [
-    { role: 'system', content: SYSTEM_PROMPT },
-    // Replay conversation history (already validated + size-capped by schema)
-    ...history.map((h) => ({ role: h.role, content: h.content } as OpenAI.Chat.ChatCompletionMessageParam)),
-    { role: 'user', content: message },
-  ];
-
   try {
-    const openai = getClient();
-
-    // 5. First completion — model may request tool calls
-    let response = await openai.chat.completions.create({
-      model: MODEL,
-      messages,
-      tools: TOOLS,
-      tool_choice: 'auto',
-      max_tokens: MAX_TOKENS,
-      temperature: 0.4, // factual but still conversational
-    });
-
-    let assistantMessage = response.choices[0].message;
-
-    // 6. Agentic tool-call loop (max 3 rounds to prevent runaway cost)
-    let rounds = 0;
-    while (
-      assistantMessage.tool_calls &&
-      assistantMessage.tool_calls.length > 0 &&
-      rounds < 3
-    ) {
-      rounds++;
-      messages.push(assistantMessage);
-
-      // Execute every tool call in this round
-      const toolResults: OpenAI.Chat.ChatCompletionToolMessageParam[] = await Promise.all(
-        assistantMessage.tool_calls.map(async (tc) => {
-          let result: string;
-          try {
-            // Guard: only standard function-type tool calls are supported
-            if (tc.type !== 'function') {
-              result = JSON.stringify({ error: `Unsupported tool type: ${tc.type}` });
-            } else {
-              const args = JSON.parse(tc.function.arguments || '{}');
-              result = await executeTool(tc.function.name, args);
-            }
-          } catch (err) {
-            result = JSON.stringify({ error: 'Tool execution failed' });
-          }
-          return {
-            role: 'tool' as const,
-            tool_call_id: tc.id,
-            content: result,
-          };
-        })
-      );
-
-      messages.push(...toolResults);
-
-      // Ask the model to produce a final response with the tool data
-      response = await openai.chat.completions.create({
-        model: MODEL,
-        messages,
-        tools: TOOLS,
-        tool_choice: 'auto',
-        max_tokens: MAX_TOKENS,
-        temperature: 0.4,
-      });
-
-      assistantMessage = response.choices[0].message;
-    }
-
-    const reply = assistantMessage.content ?? 'I\'m sorry, I could not generate a response. Please contact us on WhatsApp. 💬';
+    const reply = await runShoppingAssistant(getClient(), aiConfig(), SYSTEM_PROMPT, parsed.data, TOOLS, executeTool);
 
     res.json({ success: true, reply });
   } catch (error: any) {
@@ -442,9 +368,9 @@ router.post('/chat', async (req: Request, res: Response) => {
     const isAuthError = error?.status === 401;
 
     if (isAuthError) {
-      console.error('[AI] OpenAI authentication failed — check OPENAI_API_KEY in .env');
+      console.error('[AI] OpenAI authentication failed — check AI_API_KEY in .env');
     } else if (!isRateLimit) {
-      console.error('[AI] OpenAI request failed:', error?.message ?? error);
+      console.error('[AI] Provider request failed:', { status: error?.status, code: error?.code ?? 'AI_FAILURE' });
     }
 
     res.status(503).json({

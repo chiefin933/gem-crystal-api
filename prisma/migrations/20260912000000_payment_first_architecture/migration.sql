@@ -1,3 +1,4 @@
+-- Duplicate baseline fields are intentional: these migrations also support the earlier schema.
 -- AlterTable
 ALTER TABLE "Admin" ALTER COLUMN "pinCode" SET DEFAULT '';
 
@@ -6,8 +7,8 @@ ALTER TABLE "Coupon" ALTER COLUMN "discountValue" SET DATA TYPE DECIMAL(10,2),
 ALTER COLUMN "minOrderAmount" SET DATA TYPE DECIMAL(10,2);
 
 -- AlterTable
-ALTER TABLE "Order" ADD COLUMN     "mpesaIdempotencyKey" TEXT,
-ADD COLUMN     "paymentExpiresAt" TIMESTAMP(3),
+ALTER TABLE "Order" ADD COLUMN IF NOT EXISTS "mpesaIdempotencyKey" TEXT,
+ADD COLUMN IF NOT EXISTS "paymentExpiresAt" TIMESTAMP(3),
 ALTER COLUMN "subtotal" SET DATA TYPE DECIMAL(10,2),
 ALTER COLUMN "discount" SET DATA TYPE DECIMAL(10,2),
 ALTER COLUMN "deliveryFee" SET DATA TYPE DECIMAL(10,2),
@@ -17,13 +18,13 @@ ALTER COLUMN "total" SET DATA TYPE DECIMAL(10,2);
 ALTER TABLE "PaymentNotification" ALTER COLUMN "amount" SET DATA TYPE DECIMAL(10,2);
 
 -- AlterTable
-ALTER TABLE "PosSale" ADD COLUMN     "cashierId" TEXT,
-ADD COLUMN     "completedAt" TIMESTAMP(3),
-ADD COLUMN     "deviceId" TEXT,
-ADD COLUMN     "mpesaIdempotencyKey" TEXT,
-ADD COLUMN     "paymentExpiresAt" TIMESTAMP(3),
-ADD COLUMN     "saleStatus" TEXT NOT NULL DEFAULT 'OPEN',
-ADD COLUMN     "sessionId" TEXT,
+ALTER TABLE "PosSale" ADD COLUMN IF NOT EXISTS "cashierId" TEXT,
+ADD COLUMN IF NOT EXISTS "completedAt" TIMESTAMP(3),
+ADD COLUMN IF NOT EXISTS "deviceId" TEXT,
+ADD COLUMN IF NOT EXISTS "mpesaIdempotencyKey" TEXT,
+ADD COLUMN IF NOT EXISTS "paymentExpiresAt" TIMESTAMP(3),
+ADD COLUMN IF NOT EXISTS "saleStatus" TEXT NOT NULL DEFAULT 'OPEN',
+ADD COLUMN IF NOT EXISTS "sessionId" TEXT,
 ALTER COLUMN "subtotal" SET DATA TYPE DECIMAL(10,2),
 ALTER COLUMN "discount" SET DATA TYPE DECIMAL(10,2),
 ALTER COLUMN "total" SET DATA TYPE DECIMAL(10,2),
@@ -35,15 +36,15 @@ ALTER TABLE "Product" ALTER COLUMN "price" SET DATA TYPE DECIMAL(10,2),
 ALTER COLUMN "salePrice" SET DATA TYPE DECIMAL(10,2);
 
 -- AlterTable
-ALTER TABLE "StoreSettings" ADD COLUMN     "deliveryFeeKes" INTEGER NOT NULL DEFAULT 350,
-ADD COLUMN     "freeDeliveryThresholdKes" INTEGER NOT NULL DEFAULT 10000;
+ALTER TABLE "StoreSettings" ADD COLUMN IF NOT EXISTS "deliveryFeeKes" INTEGER NOT NULL DEFAULT 350,
+ADD COLUMN IF NOT EXISTS "freeDeliveryThresholdKes" INTEGER NOT NULL DEFAULT 10000;
 
 -- AlterTable
 ALTER TABLE "Variant" ALTER COLUMN "price" SET DATA TYPE DECIMAL(10,2),
 ALTER COLUMN "salePrice" SET DATA TYPE DECIMAL(10,2);
 
 -- CreateTable
-CREATE TABLE "UnmatchedPayment" (
+CREATE TABLE IF NOT EXISTS "UnmatchedPayment" (
     "id" TEXT NOT NULL,
     "mpesaReceipt" TEXT NOT NULL,
     "amount" DECIMAL(10,2) NOT NULL,
@@ -60,7 +61,7 @@ CREATE TABLE "UnmatchedPayment" (
 );
 
 -- CreateTable
-CREATE TABLE "CheckoutSession" (
+CREATE TABLE IF NOT EXISTS "CheckoutSession" (
     "id" TEXT NOT NULL,
     "sessionRef" TEXT NOT NULL,
     "customerName" TEXT NOT NULL,
@@ -88,7 +89,7 @@ CREATE TABLE "CheckoutSession" (
 );
 
 -- CreateTable
-CREATE TABLE "SalePayment" (
+CREATE TABLE IF NOT EXISTS "SalePayment" (
     "id" TEXT NOT NULL,
     "posSaleId" TEXT NOT NULL,
     "method" TEXT NOT NULL,
@@ -101,46 +102,46 @@ CREATE TABLE "SalePayment" (
 );
 
 -- CreateIndex
-CREATE UNIQUE INDEX "UnmatchedPayment_mpesaReceipt_key" ON "UnmatchedPayment"("mpesaReceipt");
+CREATE UNIQUE INDEX IF NOT EXISTS "UnmatchedPayment_mpesaReceipt_key" ON "UnmatchedPayment"("mpesaReceipt");
 
 -- CreateIndex
-CREATE INDEX "UnmatchedPayment_status_receivedAt_idx" ON "UnmatchedPayment"("status", "receivedAt");
+CREATE INDEX IF NOT EXISTS "UnmatchedPayment_status_receivedAt_idx" ON "UnmatchedPayment"("status", "receivedAt");
 
 -- CreateIndex
-CREATE UNIQUE INDEX "CheckoutSession_sessionRef_key" ON "CheckoutSession"("sessionRef");
+CREATE UNIQUE INDEX IF NOT EXISTS "CheckoutSession_sessionRef_key" ON "CheckoutSession"("sessionRef");
 
 -- CreateIndex
-CREATE UNIQUE INDEX "CheckoutSession_mpesaReceipt_key" ON "CheckoutSession"("mpesaReceipt");
+CREATE UNIQUE INDEX IF NOT EXISTS "CheckoutSession_mpesaReceipt_key" ON "CheckoutSession"("mpesaReceipt");
 
 -- CreateIndex
-CREATE UNIQUE INDEX "CheckoutSession_orderId_key" ON "CheckoutSession"("orderId");
+CREATE UNIQUE INDEX IF NOT EXISTS "CheckoutSession_orderId_key" ON "CheckoutSession"("orderId");
 
 -- CreateIndex
-CREATE INDEX "CheckoutSession_status_expiresAt_idx" ON "CheckoutSession"("status", "expiresAt");
+CREATE INDEX IF NOT EXISTS "CheckoutSession_status_expiresAt_idx" ON "CheckoutSession"("status", "expiresAt");
 
 -- CreateIndex
-CREATE INDEX "CheckoutSession_sessionRef_idx" ON "CheckoutSession"("sessionRef");
+CREATE INDEX IF NOT EXISTS "CheckoutSession_sessionRef_idx" ON "CheckoutSession"("sessionRef");
 
 -- CreateIndex
-CREATE UNIQUE INDEX "SalePayment_mpesaReceipt_key" ON "SalePayment"("mpesaReceipt");
+CREATE UNIQUE INDEX IF NOT EXISTS "SalePayment_mpesaReceipt_key" ON "SalePayment"("mpesaReceipt");
 
 -- CreateIndex
-CREATE INDEX "SalePayment_posSaleId_idx" ON "SalePayment"("posSaleId");
+CREATE INDEX IF NOT EXISTS "SalePayment_posSaleId_idx" ON "SalePayment"("posSaleId");
 
 -- CreateIndex
-CREATE UNIQUE INDEX "Order_mpesaIdempotencyKey_key" ON "Order"("mpesaIdempotencyKey");
+CREATE UNIQUE INDEX IF NOT EXISTS "Order_mpesaIdempotencyKey_key" ON "Order"("mpesaIdempotencyKey");
 
 -- CreateIndex
-CREATE UNIQUE INDEX "PosSale_mpesaIdempotencyKey_key" ON "PosSale"("mpesaIdempotencyKey");
+CREATE UNIQUE INDEX IF NOT EXISTS "PosSale_mpesaIdempotencyKey_key" ON "PosSale"("mpesaIdempotencyKey");
 
 -- CreateIndex
-CREATE INDEX "PosSale_cashierId_createdAt_idx" ON "PosSale"("cashierId", "createdAt");
+CREATE INDEX IF NOT EXISTS "PosSale_cashierId_createdAt_idx" ON "PosSale"("cashierId", "createdAt");
 
 -- CreateIndex
-CREATE INDEX "PosSale_sessionId_paymentStatus_idx" ON "PosSale"("sessionId", "paymentStatus");
+CREATE INDEX IF NOT EXISTS "PosSale_sessionId_paymentStatus_idx" ON "PosSale"("sessionId", "paymentStatus");
 
 -- CreateIndex
-CREATE INDEX "PosSale_saleStatus_createdAt_idx" ON "PosSale"("saleStatus", "createdAt");
+CREATE INDEX IF NOT EXISTS "PosSale_saleStatus_createdAt_idx" ON "PosSale"("saleStatus", "createdAt");
 
 -- AddForeignKey
 ALTER TABLE "SalePayment" ADD CONSTRAINT "SalePayment_posSaleId_fkey" FOREIGN KEY ("posSaleId") REFERENCES "PosSale"("id") ON DELETE CASCADE ON UPDATE CASCADE;
