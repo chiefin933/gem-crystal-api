@@ -834,7 +834,11 @@ const C2BCallbackSchema = z.object({
   // Till does not enter a sale reference.
   BillRefNumber: z.string().max(100).optional(),
   AccountReference: z.string().max(100).optional(),
-  MSISDN: z.string().min(9).max(15),
+  // C2B v1 sandbox callbacks may SHA-256 hash the MSISDN, while v2 can mask
+  // it. Accept those provider formats without mistaking them for a dialable
+  // customer phone number during settlement.
+  MSISDN: z.string().trim().min(3).max(128)
+    .regex(/^[A-Za-z0-9+*# _-]+$/, 'MSISDN contains unsupported characters'),
   FirstName: z.string().max(100).optional().default(''),
   MiddleName: z.string().max(100).optional().default(''),
   LastName: z.string().max(100).optional().default(''),

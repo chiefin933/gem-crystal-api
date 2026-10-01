@@ -133,13 +133,24 @@ export async function registerC2BUrls(): Promise<{ ResponseCode: string; Respons
 }
 
 /**
- * Normalize a phone number from a C2B callback to E.164 format.
- * Daraja typically sends MSISDN in 2547XXXXXXXX format.
+ * Normalize the payer identity from a C2B callback.
+ * Daraja can return a normal MSISDN, a masked v2 value, or a SHA-256 hash in
+ * the v1 sandbox. Opaque identities are explicitly labelled so downstream
+ * code never treats them as dialable customer phone numbers.
  */
 export function normalizeC2BPhone(msisdn: string): string {
-  const digits = msisdn.replace(/\D/g, '');
+  const raw = msisdn.trim();
+  if (/^[a-f0-9]{56,128}$/i.test(raw)) return `sha256:${raw.toLowerCase()}`;
+
+  const compact = raw.replace(/\s/g, '');
+  if (compact.includes('*')) return `masked:${compact}`;
+
+  const digits = compact.replace(/\D/g, '');
   if (digits.startsWith('254') && digits.length === 12) return `+${digits}`;
   if (digits.startsWith('0') && digits.length === 10) return `+254${digits.slice(1)}`;
   if (digits.startsWith('7') && digits.length === 9) return `+254${digits}`;
-  return `+${digits}`;
+
+  // Retain a stable audit identifier without representing unknown provider
+  // data as a phone number.
+  return `opaque:${crypto.createHash('sha256').update(raw).digest('hex')}`;
 }
