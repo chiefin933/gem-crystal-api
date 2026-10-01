@@ -363,7 +363,7 @@ router.get('/unmatched-payments', requireAdmin, requireRole('OWNER'), async (req
         take: limit,
         // rawPayload is retained for server-side audit but never returned to browsers.
         select: {
-          id: true, receipt: true, amount: true, phone: true, payerName: true,
+          id: true, mpesaReceipt: true, amount: true, phone: true, payerName: true,
           receivedAt: true, status: true, resolutionNote: true,
           resolvedAt: true, resolvedBy: true,
         },

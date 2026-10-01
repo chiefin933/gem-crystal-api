@@ -111,6 +111,37 @@ test('missing reference and wrong amount stay unmatched, never guessed', async (
   assert.equal(await db.unmatchedPayment.count(), 2);
 });
 
+test('reference-free Till payment can be reviewed, assigned, and delivered to the POS', async () => {
+  await variant('a', 2);
+  const { token, sale } = await posFixture('PENDING');
+  await processC2BPayment(db, payload('', 'TILLRECEIPT1'));
+
+  const listResponse = await fetch(`${base}/orders/unmatched-payments`, {
+    headers: { Authorization: `Bearer ${ownerToken}` },
+  });
+  assert.equal(listResponse.status, 200);
+  const list: any = await listResponse.json();
+  assert.equal(list.data.length, 1);
+  assert.equal(list.data[0].mpesaReceipt, 'TILLRECEIPT1');
+
+  const assignment = await post(`/orders/unmatched-payments/${list.data[0].id}/resolve`, {
+    action: 'ASSIGNED',
+    note: 'Verified sandbox Till payment',
+    targetType: 'POS_SALE',
+    targetRef: sale.receiptNumber,
+  }, ownerToken);
+  assert.equal(assignment.status, 200);
+
+  const notificationResponse = await fetch(`${base}/pos/payment-notifications`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  assert.equal(notificationResponse.status, 200);
+  const notification: any = await notificationResponse.json();
+  assert.equal(notification.notifications.length, 1);
+  assert.equal(notification.notifications[0].orderNumber, sale.receiptNumber);
+  assert.equal(notification.notifications[0].mpesaReceipt, 'TILLRECEIPT1');
+});
+
 test('owner can reconcile a verified payment to an expired website checkout exactly once', async () => {
   await variant(); await session('CHECK1', ['a'], { expiresAt: new Date(0) });
   await processC2BPayment(db, payload('CHECK1'));
