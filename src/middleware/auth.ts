@@ -14,6 +14,7 @@ if (!JWT_SECRET) {
 // when verified with matching iss and aud claims.
 const JWT_ISSUER = 'gem-crystal-api';
 const JWT_AUDIENCE = 'gem-crystal-admin';
+const MFA_SETUP_AUDIENCE = 'gem-crystal-mfa-setup';
 
 export type AdminRole = 'OWNER' | 'CASHIER';
 
@@ -28,6 +29,12 @@ interface JwtPayload {
   email: string;
   role: AdminRole;
   tokenVersion: number;
+}
+
+interface MfaSetupJwtPayload {
+  adminId: string;
+  email: string;
+  purpose: 'mfa-setup';
 }
 
 export async function requireAdmin(req: AuthRequest, res: Response, next: NextFunction): Promise<void> {
@@ -95,4 +102,42 @@ export function generateToken(adminId: string, email: string, role: AdminRole, t
     issuer: JWT_ISSUER,
     audience: JWT_AUDIENCE,
   });
+}
+
+export function generateMfaSetupToken(adminId: string, email: string): string {
+  return jwt.sign({ adminId, email, purpose: 'mfa-setup' }, JWT_SECRET, {
+    expiresIn: '10m',
+    issuer: JWT_ISSUER,
+    audience: MFA_SETUP_AUDIENCE,
+  });
+}
+
+export async function requireMfaSetup(req: AuthRequest, res: Response, next: NextFunction): Promise<void> {
+  const authHeader = req.headers.authorization;
+  if (!authHeader?.startsWith('Bearer ')) {
+    res.status(401).json({ success: false, error: { code: 'UNAUTHORIZED', message: 'MFA setup authentication required' } });
+    return;
+  }
+
+  try {
+    const decoded = jwt.verify(authHeader.slice('Bearer '.length).trim(), JWT_SECRET, {
+      issuer: JWT_ISSUER,
+      audience: MFA_SETUP_AUDIENCE,
+    }) as unknown as MfaSetupJwtPayload;
+
+    if (!decoded.adminId || !decoded.email || decoded.purpose !== 'mfa-setup') throw new Error('Invalid setup token');
+    const admin = await prisma.admin.findUnique({
+      where: { id: decoded.adminId },
+      select: { id: true, email: true, role: true, mfaEnabled: true },
+    });
+    if (!admin || admin.email !== decoded.email || admin.role !== 'OWNER' || admin.mfaEnabled) {
+      throw new Error('Invalid setup state');
+    }
+    req.adminId = admin.id;
+    req.adminEmail = admin.email;
+    req.adminRole = 'OWNER';
+    next();
+  } catch {
+    res.status(401).json({ success: false, error: { code: 'UNAUTHORIZED', message: 'Invalid or expired MFA setup token' } });
+  }
 }

@@ -1,5 +1,6 @@
 import { Request, Response, NextFunction } from 'express';
 import { ApiError } from '../lib/ApiError';
+import multer from 'multer';
 
 export const errorHandler = (
   err: any,
@@ -23,6 +24,19 @@ export const errorHandler = (
         code: err.code,
         message: err.message,
         details: err.details,
+      },
+    });
+  }
+
+  if (err instanceof multer.MulterError) {
+    const tooLarge = err.code === 'LIMIT_FILE_SIZE';
+    return res.status(tooLarge ? 413 : 400).json({
+      success: false,
+      error: {
+        code: tooLarge ? 'PAYLOAD_TOO_LARGE' : 'INVALID_UPLOAD',
+        message: tooLarge
+          ? 'Each image must be 5 MB or smaller.'
+          : 'Upload rejected. Send no more than four JPEG, PNG, or WEBP images.',
       },
     });
   }

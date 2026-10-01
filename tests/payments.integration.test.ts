@@ -153,7 +153,7 @@ async function posFixture(status = 'PAID') {
   const token = 'test-pos-session-token';
   await db.posSession.create({ data: { requestId: 'request1', cashierId: 'cashier1', cashierName: 'Cashier', approvedBy: 'Owner', sessionTokenHash: hash(token), expiresAt: new Date(Date.now() + 60_000) } });
   const sale = await db.posSale.create({ data: {
-    receiptNumber: 'POS1', cashierId: 'cashier1', cashierName: 'Cashier', items: JSON.stringify([{ variantId: 'a', title: 'a', size: 'M', color: 'black', quantity: 1 }]),
+    receiptNumber: 'POS1', checkoutIdempotencyKey: 'fixture-key', cashierId: 'cashier1', cashierName: 'Cashier', items: JSON.stringify([{ variantId: 'a', title: 'a', size: 'M', color: 'black', quantity: 1 }]),
     subtotal: 100, total: 100, paymentMethod: 'MPESA', paymentStatus: status,
     mpesaReceipt: status === 'PAID' ? 'POSRECEIPT' : null, paymentExpiresAt: new Date(Date.now() + 60_000),
   } });

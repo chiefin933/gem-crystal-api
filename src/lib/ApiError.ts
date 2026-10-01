@@ -2,6 +2,7 @@ export type ErrorCode =
   | 'BAD_REQUEST'
   | 'UNAUTHORIZED'
   | 'FORBIDDEN'
+  | 'CORS_ORIGIN_DENIED'
   | 'NOT_FOUND'
   | 'INVALID_CREDENTIALS'
   | 'OUT_OF_STOCK'

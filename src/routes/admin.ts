@@ -2,7 +2,20 @@ import { Router, Request, Response } from 'express';
 import bcrypt from 'bcryptjs';
 import { z } from 'zod';
 import { prisma } from '../lib/prisma';
-import { generateToken, requireAdmin, requireRole, AuthRequest } from '../middleware/auth';
+import {
+  generateMfaSetupToken,
+  generateToken,
+  requireAdmin,
+  requireRole,
+  AuthRequest,
+} from '../middleware/auth';
+import {
+  decryptMfaSecret,
+  findRecoveryCodeHash,
+  ownerMfaRequired,
+  parseRecoveryCodeHashes,
+  validateTotp,
+} from '../services/mfa';
 
 const router = Router();
 
@@ -113,7 +126,39 @@ const AdminLoginSchema = z.object({
     .string({ required_error: 'Password is required' })
     .min(6, 'Password too short')
     .max(128, 'Password exceeds maximum length'),
-});
+  mfaCode: z.string().trim().min(6).max(32).optional(),
+}).strict();
+
+type MfaAdmin = {
+  id: string;
+  email: string;
+  mfaSecretEncrypted: string | null;
+  mfaRecoveryCodeHashes: string;
+  mfaLastUsedStep: number | null;
+};
+
+async function consumeMfaCode(admin: MfaAdmin, code: string): Promise<boolean> {
+  const normalized = code.trim();
+  if (/^\d{6}$/.test(normalized) && admin.mfaSecretEncrypted) {
+    const step = validateTotp(decryptMfaSecret(admin.mfaSecretEncrypted), admin.email, normalized);
+    if (step == null) return false;
+    const consumed = await prisma.admin.updateMany({
+      where: { id: admin.id, OR: [{ mfaLastUsedStep: null }, { mfaLastUsedStep: { lt: step } }] },
+      data: { mfaLastUsedStep: step },
+    });
+    return consumed.count === 1;
+  }
+
+  const hashes = parseRecoveryCodeHashes(admin.mfaRecoveryCodeHashes);
+  const usedHash = findRecoveryCodeHash(hashes, normalized);
+  if (!usedHash) return false;
+  const remaining = hashes.filter(hash => hash !== usedHash);
+  const consumed = await prisma.admin.updateMany({
+    where: { id: admin.id, mfaRecoveryCodeHashes: admin.mfaRecoveryCodeHashes },
+    data: { mfaRecoveryCodeHashes: JSON.stringify(remaining) },
+  });
+  return consumed.count === 1;
+}
 
 // ── POST /api/admin/login ─────────────────────────────────────────────────
 router.post('/login', async (req: Request, res: Response) => {
@@ -129,7 +174,7 @@ router.post('/login', async (req: Request, res: Response) => {
   }
 
   try {
-    const { email, password } = parsed.data;
+    const { email, password, mfaCode } = parsed.data;
 
     const admin = await prisma.admin.findUnique({ where: { email } });
 
@@ -154,6 +199,34 @@ router.post('/login', async (req: Request, res: Response) => {
       return;
     }
 
+    if (admin.mfaEnabled) {
+      if (!mfaCode) {
+        res.set('Cache-Control', 'no-store').status(401).json({
+          success: false,
+          error: { code: 'MFA_REQUIRED', message: 'Enter the code from your authenticator app or a recovery code.' },
+        });
+        return;
+      }
+      if (!await consumeMfaCode(admin, mfaCode)) {
+        res.status(401).json({
+          success: false,
+          error: { code: 'INVALID_MFA_CODE', message: 'Invalid or already used authentication code.' },
+        });
+        return;
+      }
+    } else if (ownerMfaRequired()) {
+      const setupToken = generateMfaSetupToken(admin.id, admin.email);
+      res.set('Cache-Control', 'no-store').status(428).json({
+        success: false,
+        error: {
+          code: 'MFA_SETUP_REQUIRED',
+          message: 'Authenticator setup is required before production owner access.',
+          setupToken,
+        },
+      });
+      return;
+    }
+
     const token = generateToken(admin.id, admin.email, admin.role as 'OWNER' | 'CASHIER', admin.tokenVersion);
 
     // Return token and admin at the top level so both the Admin and POS
@@ -162,7 +235,7 @@ router.post('/login', async (req: Request, res: Response) => {
     res.json({
       success: true,
       token,
-      admin: { id: admin.id, email: admin.email, name: admin.name, role: admin.role },
+      admin: { id: admin.id, email: admin.email, name: admin.name, role: admin.role, mfaEnabled: admin.mfaEnabled },
     });
   } catch (error) {
     console.error('Admin login error:', error);
@@ -200,7 +273,7 @@ router.get('/me', requireAdmin, async (req: AuthRequest, res: Response) => {
   try {
     const admin = await prisma.admin.findUnique({
       where: { id: req.adminId },
-      select: { id: true, email: true, name: true, role: true, createdAt: true },
+      select: { id: true, email: true, name: true, role: true, mfaEnabled: true, createdAt: true },
     });
     if (!admin) { res.status(404).json({ error: 'Admin not found' }); return; }
     res.json(admin);

@@ -197,6 +197,14 @@ model Admin {
   // Incremented whenever the owner signs out or forces a security reset.
   // JWTs carry this value so a copied bearer token can be rejected immediately.
   tokenVersion     Int               @default(0)
+  // TOTP secrets are encrypted with MFA_ENCRYPTION_KEY. Recovery codes are
+  // one-time HMAC hashes and are never stored in plaintext.
+  mfaEnabled                 Boolean   @default(false)
+  mfaSecretEncrypted         String?
+  mfaPendingSecretEncrypted  String?
+  mfaRecoveryCodeHashes      String    @default("[]")
+  mfaLastUsedStep            Int?
+  mfaUpdatedAt               DateTime?
   createdAt        DateTime          @default(now())
   posLoginRequests PosLoginRequest[]
 }

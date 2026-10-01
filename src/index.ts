@@ -6,28 +6,29 @@ import rateLimit from 'express-rate-limit';
 import dotenv from 'dotenv';
 import { callbackDiagnostics } from './middleware/callbackDiagnostics';
 import { prisma } from './lib/prisma';
+import { ApiError } from './lib/ApiError';
+import { resolveTrustProxy, validateProductionSecurityEnvironment } from './config/security';
 
 import productsRouter from './routes/products';
 import ordersRouter from './routes/orders';
 import couponsRouter from './routes/coupons';
 import adminRouter from './routes/admin';
+import adminMfaRouter from './routes/adminMfa';
 import settingsRouter from './routes/settings';
 import posRouter from './routes/pos';
 import uploadRouter from './routes/upload';
 import aiRouter from './routes/ai';
 
 dotenv.config();
+validateProductionSecurityEnvironment(process.env);
 
 const app = express();
 const PORT = Number(process.env.PORT) || 4000;
 app.disable('x-powered-by');
 app.use(callbackDiagnostics);
 
-// Trust exactly one proxy hop (Render, Nginx, etc.) so express-rate-limit
-// reads the real client IP from X-Forwarded-For rather than the proxy IP.
-// Only set this when actually deployed behind a proxy — set to false or 0
-// for direct (no-proxy) deployments.
-app.set('trust proxy', process.env.NODE_ENV === 'production' ? 1 : false);
+// Proxy trust is explicit because rate limits and audit IPs rely on it.
+app.set('trust proxy', resolveTrustProxy(process.env));
 
 // ── Security & Performance Middleware ─────────────────────────────────────
 app.use(helmet());
@@ -37,7 +38,8 @@ const configuredOrigins = [
   process.env.STOREFRONT_URL,
   process.env.ADMIN_URL,
   process.env.POS_URL,
-].filter((origin): origin is string => Boolean(origin));
+].filter((origin): origin is string => Boolean(origin))
+  .map(origin => new URL(origin).origin);
 
 const allowedOrigins = new Set(
   process.env.NODE_ENV === 'production'
@@ -55,12 +57,19 @@ app.use(cors({
     if (allowedOrigins.has(origin)) {
       return callback(null, true);
     }
-    return callback(new Error(`CORS origin not allowed: ${origin}`));
+    return callback(ApiError.forbidden('Request origin is not allowed.', 'CORS_ORIGIN_DENIED'));
   },
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'],
   allowedHeaders: ['Content-Type', 'Authorization', 'X-POS-Poll-Token', 'X-Order-Tracking-Token'],
   maxAge: 600,
 }));
+
+// API responses can contain customer, payment, inventory, and authentication
+// data. Never let browsers or shared proxies retain them.
+app.use('/api', (_req, res, next) => {
+  res.set('Cache-Control', 'no-store');
+  next();
+});
 
 // Rate limiting for login endpoint
 const loginLimiter = rateLimit({
@@ -156,6 +165,8 @@ app.use('/api/upload', uploadLimiter, uploadRouter);
 app.use('/api/ai', aiLimiter);
 app.use('/api/ai', aiRouter);
 app.use('/api/admin/login', loginLimiter);
+app.use('/api/admin/mfa', loginLimiter);
+app.use('/api/admin/mfa', adminMfaRouter);
 app.use('/api/admin', adminRouter);
 
 // ── 404 Handler ────────────────────────────────────────────────────────────
@@ -174,7 +185,7 @@ async function start() {
     await prisma.$connect();
     console.log('✅ Database connected');
 
-    const server = app.listen(PORT, () => {
+    const server = app.listen(PORT, '0.0.0.0', () => {
       console.log('');
       console.log('🚀 Gem & Crystal API running!');
       console.log(`   http://localhost:${PORT}/api/health`);

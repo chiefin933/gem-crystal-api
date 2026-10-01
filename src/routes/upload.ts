@@ -11,6 +11,9 @@ const upload = multer({
   storage: multer.memoryStorage(),
   limits: {
     fileSize: MAX_IMAGE_BYTES,
+    files: 4,
+    fields: 0,
+    parts: 4,
   },
   fileFilter: (_req, file, cb) => {
     if (['image/jpeg', 'image/png', 'image/webp'].includes(file.mimetype)) {
@@ -116,6 +119,7 @@ router.post('/images', requireAdmin, requireRole('OWNER'), upload.array('images'
     });
   } catch (error: any) {
     console.error('[CLOUDINARY UPLOAD FAILURE]:', error.message || error);
+    if (error instanceof ApiError) return next(error);
     next(ApiError.badRequest('Image upload failed. Please verify file format and size.', 'MEDIA_UPLOAD_FAILED'));
   }
 });

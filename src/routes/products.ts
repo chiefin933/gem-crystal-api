@@ -9,6 +9,16 @@ const router = Router();
 
 const ProductKeySchema = z.string().trim().min(1).max(128);
 const PriceQuerySchema = z.string().trim().regex(/^\d{1,7}(?:\.\d{1,2})?$/, 'Invalid price filter').transform(Number);
+const HttpsImageUrlSchema = z.string().url('Each image must be a valid URL').max(2048).refine(value => {
+  try {
+    return new URL(value).protocol === 'https:';
+  } catch {
+    return false;
+  }
+}, 'Product images must use HTTPS');
+const VariantLabelSchema = z.string().trim().min(1).max(40);
+const HexColorSchema = z.string().regex(/^#[0-9a-f]{6}$/i, 'Colour must use a six-digit hex value');
+
 const ProductListQuerySchema = z.object({
   gender: z.enum(['women', 'men', 'unisex', 'all']).optional(),
   category: z.string().trim().min(1).max(80).optional(),
@@ -112,20 +122,21 @@ router.get('/:id', async (req: Request, res: Response) => {
 });
 
 const ProductSchema = z.object({
-  title: z.string().min(2),
+  title: z.string().trim().min(2).max(160),
   gender: z.enum(['women', 'men', 'unisex']),
-  category: z.string().min(1),
-  price: z.number().positive(),
-  salePrice: z.number().positive().optional(),  description: z.string().default(''),
-  fabricCare: z.string().default('Premium material blend. Hand wash or dry clean recommended.'),
-  images: z.array(z.string().url()).min(1),
-  sizes: z.array(z.string()).min(1),
-  colors: z.array(z.object({ name: z.string(), hex: z.string() })).min(1),
+  category: z.string().trim().min(1).max(80),
+  price: z.number().positive().max(10_000_000),
+  salePrice: z.number().positive().max(10_000_000).optional(),
+  description: z.string().trim().max(5000).default(''),
+  fabricCare: z.string().trim().max(1000).default('Premium material blend. Hand wash or dry clean recommended.'),
+  images: z.array(HttpsImageUrlSchema).min(1).max(12),
+  sizes: z.array(VariantLabelSchema).min(1).max(30),
+  colors: z.array(z.object({ name: VariantLabelSchema, hex: HexColorSchema }).strict()).min(1).max(30),
   isNew: z.boolean().default(false),
   isBestSeller: z.boolean().default(false),
   isFeatured: z.boolean().default(false),
-  stockPerVariant: z.number().int().positive().default(10),
-});
+  stockPerVariant: z.number().int().positive().max(100_000).default(10),
+}).strict();
 
 // ── POST /api/admin/products ──────────────────────────────────────────────
 // Admin: create a new product
@@ -184,21 +195,21 @@ router.post('/', requireAdmin, requireRole('OWNER'), async (req: AuthRequest, re
 });
 
 const UpdateProductSchema = z.object({
-  title: z.string().min(2).optional(),
+  title: z.string().trim().min(2).max(160).optional(),
   gender: z.enum(['women', 'men', 'unisex']).optional(),
-  category: z.string().min(1).optional(),
-  price: z.number().positive('Price must be positive').optional(),
-  salePrice: z.number().positive('Sale price must be positive').nullable().optional(),
-  description: z.string().optional(),
-  fabricCare: z.string().optional(),
-  images: z.array(z.string().url('Each image must be a valid URL')).min(1).optional(),
-  sizes: z.array(z.string()).min(1).optional(),
-  colors: z.array(z.object({ name: z.string(), hex: z.string() })).min(1).optional(),
+  category: z.string().trim().min(1).max(80).optional(),
+  price: z.number().positive('Price must be positive').max(10_000_000).optional(),
+  salePrice: z.number().positive('Sale price must be positive').max(10_000_000).nullable().optional(),
+  description: z.string().trim().max(5000).optional(),
+  fabricCare: z.string().trim().max(1000).optional(),
+  images: z.array(HttpsImageUrlSchema).min(1).max(12).optional(),
+  sizes: z.array(VariantLabelSchema).min(1).max(30).optional(),
+  colors: z.array(z.object({ name: VariantLabelSchema, hex: HexColorSchema }).strict()).min(1).max(30).optional(),
   isNew: z.boolean().optional(),
   isBestSeller: z.boolean().optional(),
   isFeatured: z.boolean().optional(),
   isActive: z.boolean().optional(),
-}).refine(
+}).strict().refine(
   (d) => d.salePrice == null || d.price == null || d.salePrice < d.price,
   { message: 'salePrice must be less than price', path: ['salePrice'] },
 );
@@ -307,14 +318,14 @@ router.delete('/:id', requireAdmin, requireRole('OWNER'), async (req: AuthReques
 // This route MUST be declared before /:id routes so Express doesn't eat
 // "variant" as a product id.
 const StockAdjustmentSchema = z.object({
-  variantId: z.string().min(1, 'variantId is required'),
+  variantId: z.string().trim().min(1, 'variantId is required').max(128),
   delta: z
     .number()
     .int('delta must be an integer')
     .refine(v => v !== 0, { message: 'delta must not be zero' })
     .refine(v => Math.abs(v) <= 10_000, { message: 'delta exceeds maximum adjustment of 10,000' }),
-  reason: z.string().min(2, 'reason is required').max(200),
-});
+  reason: z.string().trim().min(2, 'reason is required').max(200),
+}).strict();
 
 router.patch('/variant/stock', requireAdmin, requireRole('OWNER'), async (req: AuthRequest, res: Response) => {
   const parsed = StockAdjustmentSchema.safeParse(req.body);
@@ -328,9 +339,9 @@ router.patch('/variant/stock', requireAdmin, requireRole('OWNER'), async (req: A
 
   const { variantId, delta, reason } = parsed.data;
   const actor = req.adminEmail ?? req.adminId ?? 'unknown';
-  const ipAddress = (req.headers['x-forwarded-for'] as string | undefined)?.split(',')[0]?.trim()
-    ?? req.socket.remoteAddress
-    ?? 'unknown';
+  // Express derives req.ip according to the explicitly configured trust-proxy
+  // hop count. Never parse X-Forwarded-For directly here.
+  const ipAddress = req.ip || 'unknown';
 
   try {
     const result = await prisma.$transaction(async (tx) => {
