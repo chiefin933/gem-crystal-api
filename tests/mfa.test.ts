@@ -11,6 +11,7 @@ import {
   hashRecoveryCode,
   normaliseRecoveryCode,
   ownerMfaRequired,
+  ownerMfaLoginRequirement,
   parseRecoveryCodeHashes,
   validateTotp,
 } from '../src/services/mfa';
@@ -61,11 +62,32 @@ test('recovery codes are normalised, hashed, parsed, and timing-safe matched', (
   }
 });
 
-test('owner MFA defaults on in production and can be explicitly enabled in development', () => {
-  assert.equal(ownerMfaRequired({ NODE_ENV: 'production' } as NodeJS.ProcessEnv), true);
-  assert.equal(ownerMfaRequired({ NODE_ENV: 'production', OWNER_MFA_REQUIRED: 'false' } as NodeJS.ProcessEnv), true);
+test('owner MFA is disabled by default and can be explicitly enabled in any environment', () => {
+  assert.equal(ownerMfaRequired({ NODE_ENV: 'production' } as NodeJS.ProcessEnv), false);
+  assert.equal(ownerMfaRequired({ NODE_ENV: 'production', OWNER_MFA_REQUIRED: 'false' } as NodeJS.ProcessEnv), false);
+  assert.equal(ownerMfaRequired({ NODE_ENV: 'production', OWNER_MFA_REQUIRED: 'true' } as NodeJS.ProcessEnv), true);
   assert.equal(ownerMfaRequired({ NODE_ENV: 'development' } as NodeJS.ProcessEnv), false);
   assert.equal(ownerMfaRequired({ NODE_ENV: 'development', OWNER_MFA_REQUIRED: 'true' } as NodeJS.ProcessEnv), true);
+  assert.equal(ownerMfaLoginRequirement(true, { NODE_ENV: 'production', OWNER_MFA_REQUIRED: 'false' } as NodeJS.ProcessEnv), null);
+  assert.equal(ownerMfaLoginRequirement(false, { NODE_ENV: 'production', OWNER_MFA_REQUIRED: 'false' } as NodeJS.ProcessEnv), null);
+  assert.equal(ownerMfaLoginRequirement(true, { OWNER_MFA_REQUIRED: 'true' } as NodeJS.ProcessEnv), 'verify');
+  assert.equal(ownerMfaLoginRequirement(false, { OWNER_MFA_REQUIRED: 'true' } as NodeJS.ProcessEnv), 'setup');
+});
+
+test('production configuration does not require an MFA key while MFA is disabled', () => {
+  const env = {
+    NODE_ENV: 'production',
+    JWT_SECRET: STRONG_JWT,
+    POS_SESSION_SECRET: STRONG_POS,
+    STOREFRONT_URL: 'https://shop.example.com',
+    ADMIN_URL: 'https://admin.example.com',
+    POS_URL: 'https://pos.example.com',
+    TRUST_PROXY_HOPS: '1',
+    OWNER_MFA_REQUIRED: 'false',
+  } as NodeJS.ProcessEnv;
+
+  assert.doesNotThrow(() => validateProductionSecurityEnvironment(env));
+  assert.throws(() => validateProductionSecurityEnvironment({ ...env, OWNER_MFA_REQUIRED: 'true' }));
 });
 
 test('production configuration accepts separate HTTPS origins and explicit proxy hops', () => {

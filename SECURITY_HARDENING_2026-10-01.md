@@ -15,7 +15,7 @@ The experimental `codex/editorial-storefront` design branch was not merged or mo
 
 ### Owner authentication
 
-- Production owner access now requires TOTP multi-factor authentication and cannot be disabled with an environment flag.
+- Owner TOTP multi-factor authentication remains available but is disabled when `OWNER_MFA_REQUIRED=false`; this deliberate owner-requested override permits password-only access.
 - Initial enrollment is allowed only after a correct owner email/password through a restricted ten-minute setup token.
 - The setup token cannot call owner APIs.
 - TOTP secrets are encrypted at rest with AES-256-GCM using a dedicated 32-byte key.
@@ -161,9 +161,9 @@ Configure the M-Pesa values from `.env.example`. Set `MPESA_ENV=production` only
 
 Do not seed demo data in production.
 
-### 6. Enroll the owner in MFA
+### 6. Optional: enroll the owner in MFA
 
-On the first production admin login:
+Set `OWNER_MFA_REQUIRED=true`, retain the existing `MFA_ENCRYPTION_KEY`, and then on the first production admin login:
 
 1. Enter the correct owner email and password.
 2. The admin app will show an authenticator enrollment secret.
@@ -214,7 +214,7 @@ Verify from a clean browser profile:
 
 - storefront can load catalogue and create a checkout;
 - an order cannot be tracked without its private tracking token;
-- admin cannot enter without password plus MFA;
+- admin requires a password, and also MFA whenever `OWNER_MFA_REQUIRED=true`;
 - logout makes the prior owner token unusable;
 - POS approval produces only a short-lived POS session;
 - offline POS permits cash only and revalidates stock/price on reconnect;
@@ -306,7 +306,7 @@ Coding and automated verification are complete for this pass. These gates requir
 2. Deploy the reviewed hardened API revision and verify that Render applies all nine migrations, including owner MFA.
 3. Choose hosting and final HTTPS origins for the admin and POS applications.
 4. Supply production secrets through the hosting secret manager.
-5. Deploy and complete first-login owner MFA enrollment.
+5. Keep `OWNER_MFA_REQUIRED=false` for password-only access, or explicitly enable it and complete first-login owner MFA enrollment.
 6. Run the planned live Daraja/M-Pesa payment tests.
 7. Run browser-based acceptance testing of storefront, admin, and POS.
 8. Later, test the physical barcode scanner, receipt printer, tablet/browser kiosk behavior, and network-loss recovery.

@@ -12,7 +12,7 @@ import {
 import {
   decryptMfaSecret,
   findRecoveryCodeHash,
-  ownerMfaRequired,
+  ownerMfaLoginRequirement,
   parseRecoveryCodeHashes,
   validateTotp,
 } from '../services/mfa';
@@ -199,7 +199,9 @@ router.post('/login', async (req: Request, res: Response) => {
       return;
     }
 
-    if (admin.mfaEnabled) {
+    const mfaRequirement = ownerMfaLoginRequirement(admin.mfaEnabled);
+
+    if (mfaRequirement === 'verify') {
       if (!mfaCode) {
         res.set('Cache-Control', 'no-store').status(401).json({
           success: false,
@@ -214,7 +216,7 @@ router.post('/login', async (req: Request, res: Response) => {
         });
         return;
       }
-    } else if (ownerMfaRequired()) {
+    } else if (mfaRequirement === 'setup') {
       const setupToken = generateMfaSetupToken(admin.id, admin.email);
       res.set('Cache-Control', 'no-store').status(428).json({
         success: false,

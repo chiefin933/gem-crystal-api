@@ -24,8 +24,17 @@ function decodeEncryptionKey(raw = process.env.MFA_ENCRYPTION_KEY): Buffer {
 }
 
 export function ownerMfaRequired(env: NodeJS.ProcessEnv = process.env): boolean {
-  if (env.NODE_ENV === 'production') return true;
   return env.OWNER_MFA_REQUIRED?.trim().toLowerCase() === 'true';
+}
+
+export type OwnerMfaLoginRequirement = 'verify' | 'setup' | null;
+
+export function ownerMfaLoginRequirement(
+  mfaEnabled: boolean,
+  env: NodeJS.ProcessEnv = process.env,
+): OwnerMfaLoginRequirement {
+  if (!ownerMfaRequired(env)) return null;
+  return mfaEnabled ? 'verify' : 'setup';
 }
 
 export function assertMfaEncryptionKey(raw = process.env.MFA_ENCRYPTION_KEY): void {
