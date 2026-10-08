@@ -1,5 +1,9 @@
 # POS payment regression audit
 
+## CI dependency follow-up
+
+GitHub Actions run 37770977394 for commit 74feeec stopped at `npm audit --omit=dev --audit-level=high` before tests ran. The dependency scan flagged compression 1.8.1 (GHSA-vc2v-76pw-4v95) and proxy-addr 2.0.7 (GHSA-jqcg-44mw-7w3h). Updated compression to 1.8.2 and the Express transitive proxy-addr dependency to 2.0.8, retaining the existing audit gate. The corrected local audit reports zero vulnerabilities; TypeScript build, API unit tests and backup tests pass. This CI failure does not establish a cause for the reported missing Daraja callbacks.
+
 ## Scope and evidence
 
 Reviewed the API callback registration, validation, C2B settlement, notification delivery, cashier completion and acknowledgements; the dedicated POS polling and popup; admin registration and unmatched-payment recovery; migrations and relevant history.
