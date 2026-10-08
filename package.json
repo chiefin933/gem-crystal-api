@@ -11,7 +11,7 @@
     "db:migrate:deploy": "prisma migrate deploy",
     "db:migrate:dev": "prisma migrate dev",
     "setup:dev": "prisma migrate deploy && NODE_ENV=development tsx prisma/seed.ts",
-    "test": "node --import tsx --test tests/aiChat.test.ts tests/c2bCallbackSchema.test.ts tests/callbackDiagnostics.test.ts tests/mfa.test.ts",
+    "test": "node --import tsx --test tests/aiChat.test.ts tests/c2bCallbackSchema.test.ts tests/c2bRegistration.test.ts tests/callbackDiagnostics.test.ts tests/mfa.test.ts",
     "test:integration": "node --import tsx --test tests/payments.integration.test.ts",
     "db:backup": "node scripts/database-backup.mjs backup",
     "db:backup:verify": "node scripts/database-backup.mjs verify",

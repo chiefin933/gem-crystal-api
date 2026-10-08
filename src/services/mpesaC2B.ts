@@ -127,9 +127,18 @@ export async function registerC2BUrls(): Promise<{ ResponseCode: string; Respons
       ConfirmationURL: confirmationUrl.toString(),
       ValidationURL: validationUrl.toString(),
     }),
-  }) as any;
+  });
 
-  return res;
+  // HTTP 200 is transport success, not proof that Daraja accepted registration.
+  if (!res || typeof res !== 'object' || !('ResponseCode' in res)
+    || !['0', '00000000'].includes(String(res.ResponseCode))) {
+    throw new Error('Daraja did not confirm C2B URL registration. Check the app credentials, shortcode and callback configuration.');
+  }
+  return {
+    ResponseCode: String(res.ResponseCode),
+    ResponseDescription: 'ResponseDescription' in res && typeof res.ResponseDescription === 'string'
+      ? res.ResponseDescription : 'C2B callback URLs registered successfully.',
+  };
 }
 
 /**

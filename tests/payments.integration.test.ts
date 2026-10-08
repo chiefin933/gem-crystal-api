@@ -206,6 +206,31 @@ test('POS reconnect and duplicate completion deduct once, acknowledgement follow
   assert.equal((await db.variant.findUnique({ where: { id: 'a' } })).stockQuantity, 1);
 });
 
+test('Daraja confirmation reaches only the creating cashier and stays queued until completion', async () => {
+  await variant('a', 2);
+  const { token, sale } = await posFixture('PENDING');
+  const body = { ...payload(sale.receiptNumber), MSISDN: '2547 * 126' };
+  assert.equal((await post('/orders/c2b-callback?token=test-callback-secret', body)).status, 200);
+  assert.equal((await post('/orders/c2b-callback?token=test-callback-secret', body)).status, 200);
+  assert.equal(await db.paymentNotification.count(), 1);
+  assert.equal(await db.salePayment.count(), 1);
+  const poll = async (sessionToken: string) => (await fetch(`${base}/pos/payment-notifications`, {
+    headers: { Authorization: `Bearer ${sessionToken}` },
+  })).json() as Promise<any>;
+  const alerts = (await poll(token)).notifications;
+  assert.equal(alerts[0].orderNumber, sale.receiptNumber);
+  assert.equal(alerts[0].mpesaReceipt, body.TransID);
+  assert.equal((await db.variant.findUnique({ where: { id: 'a' } })).stockQuantity, 2);
+  await db.posSession.create({ data: { requestId: 'other-request', cashierId: 'cashier2', cashierName: 'Other',
+    approvedBy: 'Owner', sessionTokenHash: hash('other-token'), expiresAt: new Date(Date.now() + 60_000) } });
+  assert.equal((await poll('other-token')).notifications.length, 0);
+  assert.equal((await poll(token)).notifications.length, 1);
+  assert.equal((await post(`/pos/sales/${sale.id}/complete`, {}, token)).status, 200);
+  await post(`/pos/payment-notifications/${alerts[0].id}/acknowledge`, {}, token);
+  assert.equal((await poll(token)).notifications.length, 0);
+  assert.equal((await db.variant.findUnique({ where: { id: 'a' } })).stockQuantity, 1);
+});
+
 test('unpaid POS sale cannot complete or change inventory', async () => {
   await variant(); const { token, sale } = await posFixture('PENDING');
   assert.equal((await post(`/pos/sales/${sale.id}/complete`, {}, token)).status, 400);
